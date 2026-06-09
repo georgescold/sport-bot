@@ -186,19 +186,33 @@ class RessentisModal(ui.Modal, title="🏃 Ta séance du jour"):
 
 
 class SeanceView(ui.View):
-    def __init__(self, row_index, seance_txt):
+    """Vue persistante : trouve la ligne du jour dynamiquement."""
+    def __init__(self):
         super().__init__(timeout=None)
-        self.row_index  = row_index
-        self.seance_txt = seance_txt
+
+    async def _today_row(self):
+        today_str = date.today().isoformat()
+        rows = await asyncio.to_thread(get_rows)
+        row_idx = find_row(rows, today_str)
+        return rows, row_idx
 
     @ui.button(label="✅ Séance faite", style=discord.ButtonStyle.success, custom_id="btn_valider")
     async def valider(self, interaction: discord.Interaction, button: ui.Button):
-        await interaction.response.send_modal(RessentisModal(self.row_index))
+        rows, row_idx = await self._today_row()
+        if row_idx is None:
+            await interaction.response.send_message("❌ Aucune séance trouvée pour aujourd'hui.", ephemeral=True)
+            return
+        await interaction.response.send_modal(RessentisModal(row_idx))
 
     @ui.button(label="❌ Non réalisée", style=discord.ButtonStyle.danger, custom_id="btn_non_realise")
     async def non_realise(self, interaction: discord.Interaction, button: ui.Button):
-        await asyncio.to_thread(write_cell, self.row_index, COL_SEANCE,
-                                f"{self.seance_txt} — ❌ Non réalisée")
+        rows, row_idx = await self._today_row()
+        if row_idx is None:
+            await interaction.response.send_message("❌ Aucune séance trouvée pour aujourd'hui.", ephemeral=True)
+            return
+        seance_txt = rows[row_idx][COL_SEANCE].strip() if len(rows[row_idx]) > COL_SEANCE else ""
+        await asyncio.to_thread(write_cell, row_idx, COL_SEANCE,
+                                f"{seance_txt} — ❌ Non réalisée")
         await interaction.response.edit_message(
             content=(f"<@{DISCORD_USER_ID}> Pas de souci, c'est noté ! 💪\n"
                      f"Séance marquée comme non réalisée. À demain !"),
@@ -226,7 +240,7 @@ async def send_seance_msg(channel):
     if not seance_txt:
         await channel.send(f"📅 Aucune séance programmée aujourd'hui ({date_fr}).")
         return
-    view = SeanceView(row_idx, seance_txt)
+    view = SeanceView()
     await channel.send(
         content=(f"🏃 Hey <@{DISCORD_USER_ID}> ! N'oublie pas de t'entraîner ! 💪\n\n"
                  f"**📅 Séance — {jour} {date_fr}**\n> **{seance_txt}**\n\n"
@@ -239,6 +253,7 @@ async def on_ready():
     print(f"✅ Connecté : {bot.user}")
     weekly_summary_task.start()
     evening_check_task.start()
+    bot.add_view(SeanceView())
     bot.add_view(StartCoursesView())
     await bot.change_presence(
         status=discord.Status.online,
@@ -348,7 +363,7 @@ async def evening_check_task():
         return
 
     # Séance prévue mais pas encore renseignée → retag avec boutons
-    view = SeanceView(row_idx, seance_txt)
+    view = SeanceView()
     await channel.send(
         content=(f"⏰ <@{DISCORD_USER_ID}> Tu n'as pas encore renseigné ta séance ! 👀\n\n"
                  f"**📅 Rappel — {today_day} {date_fr}**\n> **{seance_txt}**\n\n"
