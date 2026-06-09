@@ -239,7 +239,7 @@ async def on_ready():
     print(f"✅ Connecté : {bot.user}")
     weekly_summary_task.start()
     evening_check_task.start()
-    check_new_courses_task.start()
+    bot.add_view(StartCoursesView())
     await bot.change_presence(
         status=discord.Status.online,
         activity=discord.Activity(type=discord.ActivityType.watching,
@@ -561,22 +561,25 @@ class CourseView(ui.View):
         await _check_all_answered(interaction.channel)
 
 
-# ── TÂCHE 3 : NOTIFICATIONS NOUVELLES COURSES ────────────────────────────────
-@tasks.loop(minutes=20)
-async def check_new_courses_task():
-    """Envoie une par une les courses avec statut 'nouveau' sur Discord."""
-    channel = bot.get_channel(DISCORD_CHANNEL_ID)
-    if not channel:
-        return
+# ── PRÉSENTATION DES COURSES (déclenchée par bouton Discord) ─────────────────
+
+async def present_courses_one_by_one(channel):
+    """Envoie les courses 'nouveau' une par une avec boutons Oui/Non."""
     try:
         rows = await asyncio.to_thread(get_course_rows)
-    except Exception:
+    except Exception as e:
+        await channel.send(f"❌ Erreur lecture sheet : {e}")
         return
-    for i, row in enumerate(rows):
-        if not row or len(row) < 5:
-            continue
-        if row[4].strip().lower() != "nouveau":
-            continue
+
+    nouveau = [
+        (i, row) for i, row in enumerate(rows)
+        if row and len(row) >= 5 and row[4].strip().lower() == "nouveau"
+    ]
+    if not nouveau:
+        await channel.send(f"<@{DISCORD_USER_ID}> Aucune nouvelle course à présenter !")
+        return
+
+    for i, row in nouveau:
         date_txt = row[0].strip()
         lieux    = row[1].strip()
         distance = row[2].strip()
@@ -594,9 +597,19 @@ async def check_new_courses_task():
         await asyncio.to_thread(update_course_status, i, "notifié")
         view = CourseView(i, nom)
         await channel.send(content=content, view=view)
-        await asyncio.sleep(3)
+        await asyncio.sleep(2)
 
 
-@check_new_courses_task.before_loop
-async def before_courses():
-    await bot.wait_until_ready()
+class StartCoursesView(ui.View):
+    """Bouton persistant : déclenche la présentation des courses."""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @ui.button(label="🏃 Voir mes courses", style=discord.ButtonStyle.success,
+               custom_id="start_courses_presentation")
+    async def start_courses(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.edit_message(
+            content="🏃 C'est parti ! Je t'envoie les courses une par une...",
+            view=None
+        )
+        await present_courses_one_by_one(interaction.channel)
