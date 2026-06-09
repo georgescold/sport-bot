@@ -252,46 +252,87 @@ def get_weekly_data():
 
 
 def generate_chart(sorted_weeks) -> io.BytesIO:
-    """Génère un graphique Strava-like et retourne un buffer PNG."""
+    """Génère un graphique style Strava (courbe + aire + points) et retourne un buffer PNG."""
     labels = []
     kms    = []
+    months = []  # étiquettes mois pour l'axe X
 
     for (yr, wk), data in sorted_weeks:
         s = data["start"]
-        labels.append(s.strftime("%-d %b").lower())
+        labels.append(s)
         kms.append(data["km"])
 
-    fig, ax = plt.subplots(figsize=(10, 4))
-    fig.patch.set_facecolor("#1c1c1e")
-    ax.set_facecolor("#1c1c1e")
+    # Construire les étiquettes mois (afficher seulement au changement de mois)
+    MOIS_ABBR = {1:"JAN",2:"FÉV",3:"MAR",4:"AVR",5:"MAI",6:"JUIN",
+                 7:"JUI",8:"AOÛ",9:"SEP",10:"OCT",11:"NOV",12:"DÉC"}
+    x_ticks = []
+    x_labels = []
+    last_month = None
+    for i, d in enumerate(labels):
+        if d.month != last_month:
+            x_ticks.append(i)
+            x_labels.append(MOIS_ABBR[d.month])
+            last_month = d.month
 
-    x = range(len(labels))
-    bars = ax.bar(x, kms, color="#FC4C02", width=0.6, zorder=3)
+    x = list(range(len(kms)))
 
-    # Mettre la dernière barre (semaine en cours) plus claire
-    if bars:
-        bars[-1].set_color("#FF8C6B")
+    BG     = "#191919"
+    ORANGE = "#FC4C02"
+    GRID   = "#2a2a2a"
 
-    # Valeurs au-dessus des barres
-    for bar, km in zip(bars, kms):
-        if km > 0:
-            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.3,
-                    f"{km:.0f}", ha="center", va="bottom",
-                    color="white", fontsize=8, fontweight="bold")
+    fig, ax = plt.subplots(figsize=(11, 4.5))
+    fig.patch.set_facecolor(BG)
+    ax.set_facecolor(BG)
 
-    ax.set_xticks(list(x))
-    ax.set_xticklabels(labels, rotation=45, ha="right", color="#aaaaaa", fontsize=8)
-    ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda v, _: f"{v:.0f} km"))
-    ax.tick_params(colors="#aaaaaa")
-    ax.spines[:].set_visible(False)
-    ax.yaxis.set_tick_params(labelcolor="#aaaaaa")
-    ax.grid(axis="y", color="#333333", linewidth=0.5, zorder=0)
-    ax.set_title("📈 Progression km — 16 dernières semaines",
-                 color="white", fontsize=12, pad=12)
+    # Aire de remplissage sous la courbe
+    ax.fill_between(x, kms, color=ORANGE, alpha=0.25, zorder=1)
 
-    plt.tight_layout()
+    # Barres verticales légères (ombre)
+    ax.bar(x, kms, color=ORANGE, alpha=0.18, width=0.8, zorder=1)
+
+    # Ligne principale
+    ax.plot(x, kms, color=ORANGE, linewidth=2.2, zorder=3)
+
+    # Points sur chaque semaine
+    ax.scatter(x, kms, color=ORANGE, s=38, zorder=4, edgecolors=BG, linewidths=1.5)
+
+    # Label uniquement sur le pic max
+    if kms:
+        peak_i = kms.index(max(kms))
+        if kms[peak_i] > 0:
+            ax.annotate(
+                f"{kms[peak_i]:.0f} km",
+                xy=(peak_i, kms[peak_i]),
+                xytext=(0, 10), textcoords="offset points",
+                ha="center", color="white", fontsize=9, fontweight="bold"
+            )
+
+    # Axe X : seulement les mois
+    ax.set_xticks(x_ticks)
+    ax.set_xticklabels(x_labels, color="#888888", fontsize=10, fontweight="bold")
+    ax.tick_params(axis="x", length=0, pad=8)
+
+    # Axe Y
+    max_km = max(kms) if kms else 10
+    ax.set_ylim(0, max_km * 1.25)
+    yticks = [0, round(max_km / 2), round(max_km)]
+    ax.set_yticks(yticks)
+    ax.set_yticklabels([f"{v} km" for v in yticks], color="#888888", fontsize=9)
+    ax.tick_params(axis="y", length=0)
+
+    # Grille horizontale uniquement
+    ax.yaxis.grid(True, color=GRID, linewidth=0.8, zorder=0)
+    ax.xaxis.grid(False)
+
+    # Supprimer les bordures
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+    ax.set_xlim(-0.5, len(x) - 0.5)
+    plt.tight_layout(pad=1.5)
+
     buf = io.BytesIO()
-    plt.savefig(buf, format="png", dpi=150, facecolor="#1c1c1e")
+    plt.savefig(buf, format="png", dpi=150, facecolor=BG)
     plt.close(fig)
     buf.seek(0)
     return buf
