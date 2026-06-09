@@ -21,7 +21,7 @@ DISCORD_BOT_TOKEN    = os.environ["DISCORD_BOT_TOKEN"]
 DISCORD_CHANNEL_ID   = int(os.environ["DISCORD_CHANNEL_ID"])
 DISCORD_USER_ID      = int(os.environ["DISCORD_USER_ID"])
 SPREADSHEET_ID       = os.environ["SPREADSHEET_ID"]
-SHEET_NAME           = os.environ.get("SHEET_NAME", "Données Loys")
+SHEET_NAME           = "Données Loys"  # NE PAS MODIFIER — jamais écrire dans "Données Nico"
 SA_JSON              = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 
 COL_SEANCE = 2; COL_RESSENTIS = 5; COL_KM_JOUR = 7; COL_DATE = 0; COL_JOUR = 1
