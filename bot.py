@@ -1,290 +1,182 @@
 """
 bot.py — Bot Discord persistant "Road to sub 38"
--------------------------------------------------
 Tourne 24h/24 sur Railway. Gère :
-  !seance              → envoie immédiatement la séance du jour avec boutons
-  !programme <date> : <description> → écrit dans le Google Sheet
-
-Les boutons (✅/❌) et modales restent gérés par Vercel (api/discord.py).
+  - !seance              → séance du jour avec boutons
+  - !programme <date> : <description> → écrit dans le Google Sheet
+  - Clic ✅              → ouvre une modale ressentis + km
+  - Clic ❌              → marque séance non réalisée
+  - Soumission modale    → écrit ressentis + km dans le sheet
 """
 
-import os
-import re
-import json
-import asyncio
+import os, re, json, asyncio
 from datetime import date
-
 import discord
 from discord.ext import commands
+from discord import ui
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-# ──────────────────────────────────────────────
-# CONFIG
-# ──────────────────────────────────────────────
-DISCORD_BOT_TOKEN        = os.environ["DISCORD_BOT_TOKEN"]
-DISCORD_CHANNEL_ID       = int(os.environ["DISCORD_CHANNEL_ID"])
-DISCORD_USER_ID          = int(os.environ["DISCORD_USER_ID"])
-SPREADSHEET_ID           = os.environ["SPREADSHEET_ID"]
-SHEET_NAME               = os.environ.get("SHEET_NAME", "Données Loys")
-SERVICE_ACCOUNT_JSON     = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
+# ── CONFIG ────────────────────────────────────
+DISCORD_BOT_TOKEN    = os.environ["DISCORD_BOT_TOKEN"]
+DISCORD_CHANNEL_ID   = int(os.environ["DISCORD_CHANNEL_ID"])
+DISCORD_USER_ID      = int(os.environ["DISCORD_USER_ID"])
+SPREADSHEET_ID       = os.environ["SPREADSHEET_ID"]
+SHEET_NAME           = os.environ.get("SHEET_NAME", "Données Loys")
+SA_JSON              = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 
-COL_DATE      = 0
-COL_JOUR      = 1
-COL_SEANCE    = 2
-COL_RESSENTIS = 5
-COL_KM_JOUR   = 7
+COL_SEANCE = 2; COL_RESSENTIS = 5; COL_KM_JOUR = 7; COL_DATE = 0; COL_JOUR = 1
 
-JOURS_FR = {
-    "Monday": "Lundi", "Tuesday": "Mardi", "Wednesday": "Mercredi",
-    "Thursday": "Jeudi", "Friday": "Vendredi", "Saturday": "Samedi", "Sunday": "Dimanche"
-}
+JOURS_FR = {"Monday":"Lundi","Tuesday":"Mardi","Wednesday":"Mercredi",
+            "Thursday":"Jeudi","Friday":"Vendredi","Saturday":"Samedi","Sunday":"Dimanche"}
+MOIS_FR  = {"janvier":1,"février":2,"mars":3,"avril":4,"mai":5,"juin":6,
+            "juillet":7,"août":8,"septembre":9,"octobre":10,"novembre":11,"décembre":12}
 
-JOURS_TO_WEEKDAY = {
-    "lundi": 0, "mardi": 1, "mercredi": 2, "jeudi": 3,
-    "vendredi": 4, "samedi": 5, "dimanche": 6
-}
-
-MOIS_FR = {
-    "janvier": 1, "février": 2, "mars": 3, "avril": 4, "mai": 5, "juin": 6,
-    "juillet": 7, "août": 8, "septembre": 9, "octobre": 10, "novembre": 11, "décembre": 12
-}
-
-# ──────────────────────────────────────────────
-# GOOGLE SHEETS
-# ──────────────────────────────────────────────
-def get_sheets_service():
-    info = json.loads(SERVICE_ACCOUNT_JSON)
+# ── GOOGLE SHEETS ─────────────────────────────
+def sheets():
     creds = service_account.Credentials.from_service_account_info(
-        info, scopes=["https://www.googleapis.com/auth/spreadsheets"]
-    )
+        json.loads(SA_JSON), scopes=["https://www.googleapis.com/auth/spreadsheets"])
     return build("sheets", "v4", credentials=creds)
 
+def get_rows():
+    r = sheets().spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID, range=f"'{SHEET_NAME}'!A:H").execute()
+    return r.get("values", [])
 
-def get_all_rows():
-    svc = get_sheets_service()
-    result = svc.spreadsheets().values().get(
-        spreadsheetId=SPREADSHEET_ID,
-        range=f"'{SHEET_NAME}'!A:H"
-    ).execute()
-    return result.get("values", [])
-
-
-def find_row_for_date(rows, target_date: str):
-    for i, row in enumerate(rows):
-        if row and len(row) > COL_DATE and row[COL_DATE].strip() == target_date:
-            return i
+def find_row(rows, d):
+    for i, r in enumerate(rows):
+        if r and r[0].strip() == d: return i
     return None
 
-
-def update_cell(row_index: int, col_index: int, value: str):
-    svc = get_sheets_service()
-    col_letter = chr(ord("A") + col_index)
-    cell_range = f"'{SHEET_NAME}'!{col_letter}{row_index + 1}"
-    svc.spreadsheets().values().update(
+def write_cell(row, col, val):
+    sheets().spreadsheets().values().update(
         spreadsheetId=SPREADSHEET_ID,
-        range=cell_range,
-        valueInputOption="RAW",
-        body={"values": [[value]]}
-    ).execute()
+        range=f"'{SHEET_NAME}'!{chr(65+col)}{row+1}",
+        valueInputOption="RAW", body={"values": [[val]]}).execute()
 
-
-def parse_date_fr(text: str):
-    text = text.strip().lower()
-    current_year = date.today().year
-
+def parse_date(text):
+    text = text.strip().lower(); y = date.today().year
     m = re.match(r"(\d{4})-(\d{2})-(\d{2})", text)
-    if m:
-        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
-
+    if m: return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
     m = re.match(r"(\d{1,2})/(\d{1,2})(?:/(\d{4}))?", text)
-    if m:
-        y = int(m.group(3)) if m.group(3) else current_year
-        return f"{y}-{int(m.group(2)):02d}-{int(m.group(1)):02d}"
-
+    if m: return f"{int(m.group(3) or y):04d}-{int(m.group(2)):02d}-{int(m.group(1)):02d}"
     m = re.search(r"(\d{1,2})\s+(\w+)", text)
     if m:
-        day = int(m.group(1))
-        month = MOIS_FR.get(m.group(2).lower())
-        if month:
-            return f"{current_year}-{month:02d}-{day:02d}"
-
+        mo = MOIS_FR.get(m.group(2))
+        if mo: return f"{y}-{mo:02d}-{int(m.group(1)):02d}"
     return None
 
+# ── VUES DISCORD (boutons + modale) ───────────
+class RessentisModal(ui.Modal, title="🏃 Ta séance du jour"):
+    ressentis = ui.TextInput(label="Ressentis + FC moyenne à l'effort",
+        style=discord.TextStyle.paragraph,
+        placeholder="Ex: Bonne séance, jambes légères. FC moy: 145 bpm",
+        min_length=2, max_length=500)
+    km = ui.TextInput(label="Kilomètres réalisés",
+        placeholder="Ex: 5.2", min_length=1, max_length=10)
 
-def build_reminder_payload(seance: str, jour: str, date_fr: str, row_index: int) -> dict:
-    return {
-        "content": (
-            f"🏃 Hey <@{DISCORD_USER_ID}> ! N'oublie pas de t'entraîner ! 💪\n\n"
-            f"**📅 Séance — {jour} {date_fr}**\n"
-            f"> **{seance}**\n\n"
-            f"Clique sur un bouton une fois ta séance terminée 👇"
-        ),
-        "components": [
-            {
-                "type": 1,
-                "components": [
-                    {
-                        "type": 2,
-                        "style": 3,
-                        "label": "✅ Séance faite",
-                        "custom_id": f"valider_{row_index}"
-                    },
-                    {
-                        "type": 2,
-                        "style": 4,
-                        "label": "❌ Non réalisée",
-                        "custom_id": f"non_realise_{row_index}"
-                    }
-                ]
-            }
-        ]
-    }
+    def __init__(self, row_index):
+        super().__init__()
+        self.row_index = row_index
+
+    async def on_submit(self, interaction: discord.Interaction):
+        r = str(self.ressentis); k = str(self.km).replace(",", ".")
+        await asyncio.to_thread(write_cell, self.row_index, COL_RESSENTIS, r)
+        await asyncio.to_thread(write_cell, self.row_index, COL_KM_JOUR, k)
+        await interaction.response.edit_message(
+            content=(f"<@{DISCORD_USER_ID}> Super, c'est noté ! 🎉\n"
+                     f"**Ressentis :** {r}\n**Km :** {k} km\n"
+                     f"Bravo pour la séance ! 🏃‍♂️🔥"),
+            view=None)
 
 
-# ──────────────────────────────────────────────
-# BOT DISCORD
-# ──────────────────────────────────────────────
+class SeanceView(ui.View):
+    def __init__(self, row_index, seance_txt):
+        super().__init__(timeout=None)
+        self.row_index  = row_index
+        self.seance_txt = seance_txt
+
+    @ui.button(label="✅ Séance faite", style=discord.ButtonStyle.success,
+               custom_id="btn_valider")
+    async def valider(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.send_modal(RessentisModal(self.row_index))
+
+    @ui.button(label="❌ Non réalisée", style=discord.ButtonStyle.danger,
+               custom_id="btn_non_realise")
+    async def non_realise(self, interaction: discord.Interaction, button: ui.Button):
+        await asyncio.to_thread(write_cell, self.row_index, COL_SEANCE,
+                                f"{self.seance_txt} — ❌ Non réalisée")
+        await interaction.response.edit_message(
+            content=(f"<@{DISCORD_USER_ID}> Pas de souci, c'est noté ! 💪\n"
+                     f"Séance marquée comme non réalisée. À demain !"),
+            view=None)
+
+
+# ── BOT ───────────────────────────────────────
 intents = discord.Intents.default()
 intents.message_content = True
-
 bot = commands.Bot(command_prefix="!", intents=intents)
-
 
 @bot.event
 async def on_ready():
-    print(f"✅ Bot connecté : {bot.user} (ID: {bot.user.id})")
+    print(f"✅ Connecté : {bot.user}")
     await bot.change_presence(
         status=discord.Status.online,
-        activity=discord.Activity(
-            type=discord.ActivityType.watching,
-            name="ton plan d'entraînement 🏃"
-        )
-    )
+        activity=discord.Activity(type=discord.ActivityType.watching,
+                                  name="ton plan d'entraînement 🏃"))
 
-
-@bot.command(name="seance")
-async def seance(ctx):
-    """!seance → envoie la séance du jour avec boutons."""
-    if ctx.channel.id != DISCORD_CHANNEL_ID:
-        return
-
+async def send_seance(channel):
     today_str = date.today().isoformat()
     today_day = JOURS_FR[date.today().strftime("%A")]
     date_fr   = date.today().strftime("%d/%m/%Y")
-
-    try:
-        rows    = await asyncio.to_thread(get_all_rows)
-        row_idx = find_row_for_date(rows, today_str)
-    except Exception as e:
-        await ctx.send(f"❌ Erreur Google Sheets : {e}")
-        return
-
+    rows    = await asyncio.to_thread(get_rows)
+    row_idx = find_row(rows, today_str)
     if row_idx is None:
-        await ctx.send(
-            f"<@{DISCORD_USER_ID}> Aucune séance trouvée pour aujourd'hui "
-            f"({today_str}) dans le planning. 🤔"
-        )
+        await channel.send(f"<@{DISCORD_USER_ID}> Aucune séance trouvée pour aujourd'hui ({today_str}) 🤔")
         return
-
-    row    = rows[row_idx]
+    row        = rows[row_idx]
     seance_txt = row[COL_SEANCE].strip() if len(row) > COL_SEANCE else "Repos"
-    jour   = row[COL_JOUR].strip() if len(row) > COL_JOUR else today_day
-
-    payload = build_reminder_payload(seance_txt, jour, date_fr, row_idx)
-
-    await ctx.message.delete()   # Supprime le message "!seance" pour garder le channel propre
-    channel = bot.get_channel(DISCORD_CHANNEL_ID)
+    jour       = row[COL_JOUR].strip()   if len(row) > COL_JOUR   else today_day
+    view = SeanceView(row_idx, seance_txt)
     await channel.send(
-        content=payload["content"],
-        components=payload["components"] if hasattr(discord, "ui") else None
-    )
+        content=(f"🏃 Hey <@{DISCORD_USER_ID}> ! N'oublie pas de t'entraîner ! 💪\n\n"
+                 f"**📅 Séance — {jour} {date_fr}**\n> **{seance_txt}**\n\n"
+                 f"Clique sur un bouton une fois ta séance terminée 👇"),
+        view=view)
 
-    # Envoi via l'API raw pour supporter les components
-    import aiohttp
-    headers = {
-        "Authorization": f"Bot {DISCORD_BOT_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    async with aiohttp.ClientSession() as session:
-        await session.post(
-            f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ID}/messages",
-            headers=headers,
-            json=payload
-        )
-
+@bot.command(name="seance")
+async def cmd_seance(ctx):
+    if ctx.channel.id != DISCORD_CHANNEL_ID: return
+    try: await ctx.message.delete()
+    except: pass
+    await send_seance(ctx.channel)
 
 @bot.command(name="programme")
-async def programme(ctx, *, args: str = ""):
-    """!programme <date> : <description> → écrit dans le sheet."""
-    if ctx.channel.id != DISCORD_CHANNEL_ID:
-        return
-
+async def cmd_programme(ctx, *, args: str = ""):
+    if ctx.channel.id != DISCORD_CHANNEL_ID: return
     m = re.match(r"(.+?)\s*:\s*(.+)", args)
     if not m:
-        await ctx.reply(
-            "Format incorrect 🙁\n"
-            "Utilise : `!programme <date> : <description>`\n"
-            "Exemples :\n"
-            "• `!programme mardi 16 juin : footing 30min`\n"
-            "• `!programme 16/06 : vélo 1h`"
-        )
+        await ctx.reply("Format : `!programme <date> : <séance>`\nEx: `!programme mardi 16 juin : footing 30min`")
         return
-
-    date_raw = m.group(1).strip()
-    seance   = m.group(2).strip()
-    date_iso = parse_date_fr(date_raw)
-
+    date_raw, seance = m.group(1).strip(), m.group(2).strip()
+    date_iso = parse_date(date_raw)
     if not date_iso:
-        await ctx.reply(
-            f"Je n'ai pas réussi à lire la date `{date_raw}` 🙁\n"
-            f"Essaie : `16 juin`, `16/06` ou `2026-06-16`"
-        )
+        await ctx.reply(f"Date `{date_raw}` non reconnue. Essaie `16 juin`, `16/06` ou `2026-06-16`.")
         return
-
-    try:
-        rows    = await asyncio.to_thread(get_all_rows)
-        row_idx = find_row_for_date(rows, date_iso)
-    except Exception as e:
-        await ctx.reply(f"❌ Erreur Google Sheets : {e}")
-        return
-
+    rows    = await asyncio.to_thread(get_rows)
+    row_idx = find_row(rows, date_iso)
     if row_idx is None:
-        await ctx.reply(
-            f"Aucune ligne trouvée pour **{date_raw}** ({date_iso}) dans le planning.\n"
-            f"Vérifie que cette date existe dans le Google Sheet."
-        )
+        await ctx.reply(f"Aucune ligne trouvée pour **{date_raw}** ({date_iso}) dans le planning.")
         return
-
+    await asyncio.to_thread(write_cell, row_idx, COL_SEANCE, seance)
     try:
-        await asyncio.to_thread(update_cell, row_idx, COL_SEANCE, seance)
-    except Exception as e:
-        await ctx.reply(f"❌ Erreur lors de l'écriture dans le sheet : {e}")
-        return
-
-    try:
-        d       = date.fromisoformat(date_iso)
-        jour    = JOURS_FR[d.strftime("%A")]
-        affiche = f"{jour} {d.strftime('%d/%m/%Y')}"
-    except Exception:
-        affiche = date_iso
-
-    await ctx.reply(
-        f"✅ Séance programmée !\n"
-        f"**{affiche}** → **{seance}**\n"
-        f"C'est noté dans ton plan 📋"
-    )
-
+        d = date.fromisoformat(date_iso)
+        affiche = f"{JOURS_FR[d.strftime('%A')]} {d.strftime('%d/%m/%Y')}"
+    except: affiche = date_iso
+    await ctx.reply(f"✅ **{affiche}** → **{seance}**\nC'est noté dans ton plan 📋")
 
 @bot.event
 async def on_command_error(ctx, error):
-    if isinstance(error, commands.CommandNotFound):
-        return
-    print(f"Erreur commande : {error}")
+    if isinstance(error, commands.CommandNotFound): return
+    print(f"Erreur : {error}")
 
-
-# ──────────────────────────────────────────────
-# LANCEMENT
-# ──────────────────────────────────────────────
-if __name__ == "__main__":
-    bot.run(DISCORD_BOT_TOKEN)
+bot.run(DISCORD_BOT_TOKEN)
