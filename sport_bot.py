@@ -31,7 +31,7 @@ from googleapiclient.discovery import build
 # ──────────────────────────────────────────────
 SPREADSHEET_ID       = "1jCijlZVgIGK-8TCbM9zwv7c3F4BSsMZNlTHV_iMzFPM"
 SHEET_NAME           = "Données Loys"
-DISCORD_TOKEN        = os.environ["DISCORD_BOT_TOKEN"]
+DISCORD_TOKEN        = os.environ.get("DISCORD_BOT_TOKEN", "")
 CHANNEL_ID           = "1513887659339288676"
 USER_ID              = "340479270449315840"
 SERVICE_ACCOUNT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -490,4 +490,376 @@ def run_check():
 
     # Les réponses aux boutons (ressentis, km, ❌) sont désormais
     # gérées directement par le serveur Vercel (api/discord.py).
-    print("  ℹ️  Réponses aux boutons gérées par Ver
+    print("  ℹ️  Réponses aux boutons gérées par le bot Railway (bot.py).")
+
+# ──────────────────────────────────────────────
+# COMMANDES DISCORD (!claude) — traitement IA
+# ──────────────────────────────────────────────
+COMMANDS_SHEET = "Commandes"
+
+
+def ensure_commands_sheet():
+    svc   = get_sheets_service()
+    meta  = svc.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
+    titles = [s["properties"]["title"] for s in meta.get("sheets", [])]
+    if COMMANDS_SHEET in titles:
+        return
+    svc.spreadsheets().batchUpdate(
+        spreadsheetId=SPREADSHEET_ID,
+        body={"requests": [{"addSheet": {"properties": {"title": COMMANDS_SHEET}}}]}
+    ).execute()
+    svc.spreadsheets().values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"'{COMMANDS_SHEET}'!A1:C1",
+        valueInputOption="RAW",
+        body={"values": [["Timestamp", "Demande", "Statut"]]}
+    ).execute()
+
+
+def get_pending_commands():
+    svc = get_sheets_service()
+    res = svc.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"'{COMMANDS_SHEET}'!A:C"
+    ).execute()
+    rows = res.get("values", [])
+    pending = []
+    for i, row in enumerate(rows):
+        if len(row) >= 3 and row[2].strip().lower() == "pending":
+            ts      = row[0].strip() if len(row) > 0 else ""
+            demande = row[1].strip() if len(row) > 1 else ""
+            pending.append((i, ts, demande))
+    return pending
+
+
+def mark_command_done(sheet_row: int, reponse: str):
+    svc = get_sheets_service()
+    svc.spreadsheets().values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"'{COMMANDS_SHEET}'!C{sheet_row + 1}",
+        valueInputOption="RAW",
+        body={"values": [["done"]]}
+    ).execute()
+    svc.spreadsheets().values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"'{COMMANDS_SHEET}'!D{sheet_row + 1}",
+        valueInputOption="RAW",
+        body={"values": [[reponse[:500]]]}
+    ).execute()
+
+
+def format_sheet_context(rows) -> str:
+    lines = []
+    for row in rows[1:]:
+        if not row or not row[0].strip():
+            continue
+        date_s = row[0].strip() if len(row) > 0 else ""
+        jour   = row[1].strip() if len(row) > 1 else ""
+        seance = row[2].strip() if len(row) > 2 else ""
+        ress   = row[5].strip() if len(row) > 5 else ""
+        km     = row[7].strip() if len(row) > 7 else ""
+        lines.append(
+            f"{date_s} | {jour} | Séance: {seance or '—'} | "
+            f"Ressentis: {ress or '—'} | Km: {km or '—'}"
+        )
+    return "\n".join(lines[-60:])
+
+
+def run_process_commands():
+    print(f"🤖 MODE PROCESS-COMMANDS — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    ensure_commands_sheet()
+
+    pending = get_pending_commands()
+    if not pending:
+        print("  ✅ Aucune commande en attente.")
+        return
+
+    print(f"  📬 {len(pending)} commande(s) à traiter.")
+
+    main_rows = get_all_rows()
+    sheet_ctx = format_sheet_context(main_rows)
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        print("  ❌ ANTHROPIC_API_KEY manquante dans les variables d'environnement Cowork.")
+        return
+
+    try:
+        import anthropic as anthropic_sdk
+    except ImportError:
+        import subprocess
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "anthropic",
+             "--break-system-packages", "-q"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        import anthropic as anthropic_sdk
+
+    client = anthropic_sdk.Anthropic(api_key=api_key)
+
+    for sheet_row, ts, request in pending:
+        print(f'  → Traitement : "{request[:60]}..."')
+
+        system_prompt = (
+            "Tu es l'assistant sport de Loys (objectif sub-38 sur 10km).\n"
+            "Tu gères son Google Sheet de suivi. Colonnes :\n"
+            "- A (index 0) : Date ISO — NE PAS MODIFIER\n"
+            "- B (index 1) : Jour — NE PAS MODIFIER\n"
+            "- C (index 2) : Séance programmée\n"
+            "- F (index 5) : Ressentis + FC\n"
+            "- H (index 7) : Km réalisés (nombre décimal)\n"
+            "- J (index 9) : Km semaine — NE PAS MODIFIER\n\n"
+            "Réponds UNIQUEMENT avec un JSON valide, sans markdown :\n"
+            '{"actions":[{"date":"YYYY-MM-DD","col":<int>,"value":"<valeur>",'
+            '"reason":"<explication>"}],"message":"<confirmation française>"}\n\n'
+            "RÈGLES : ne jamais toucher cols 0, 1, 9. Si ambigu : actions vide + explication.\n"
+            f"Aujourd'hui : {date.today().isoformat()}"
+        )
+        user_msg = f"Sheet actuel :\n{sheet_ctx}\n\nDemande : \"{request}\""
+
+        try:
+            resp = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=1024,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_msg}]
+            )
+            raw = resp.content[0].text.strip()
+            json_match = re.search(r'\{.*\}', raw, re.DOTALL)
+            result_json = json.loads(json_match.group() if json_match else raw)
+        except Exception as e:
+            print(f"  ❌ Erreur IA : {e}")
+            mark_command_done(sheet_row, f"Erreur IA : {e}")
+            send_message(f"<@{USER_ID}> ❌ Erreur lors du traitement de ta demande : {e}")
+            continue
+
+        actions = result_json.get("actions", [])
+        message = result_json.get("message", "Action effectuée.")
+
+        if not actions:
+            mark_command_done(sheet_row, message)
+            send_message(f"<@{USER_ID}> ℹ️ {message}")
+            continue
+
+        svc    = get_sheets_service()
+        errors = []
+        for action in actions:
+            row_idx = find_row_for_date(main_rows, action["date"])
+            if row_idx is None:
+                errors.append(f"Date {action['date']} introuvable.")
+                continue
+            col = int(action["col"])
+            if col in [0, 1, 9]:
+                errors.append(f"Colonne {col} protégée.")
+                continue
+            try:
+                update_cell(svc, row_idx, col, str(action["value"]))
+            except Exception as e:
+                errors.append(str(e))
+
+        reply = f"✅ {message}"
+        if errors:
+            reply += f"\n⚠️ {'; '.join(errors)}"
+        mark_command_done(sheet_row, reply)
+        send_message(f"<@{USER_ID}> {reply}")
+        print(f"  ✅ Traité : {message}")
+
+
+# ──────────────────────────────────────────────
+# COURSES — Calendrier des courses à venir
+# ──────────────────────────────────────────────
+COURSES_SHEET          = "Courses"
+JOGGING_PLUS_HDF       = "https://jogging-plus.com/calendrier/courses-5-10-15-km/hauts-de-france/"
+JOGGING_PLUS_GRAND_EST = "https://jogging-plus.com/calendrier/courses-5-10-15-km/grand-est/"
+
+# Départements prioritaires : Aisne(02), Ardennes(08), Marne(51), Oise(60), Somme(80)
+DEPTS_PRIORITAIRES = ["(02 ", "(08 ", "(51 ", "(60 ", "(80 "]
+# Nord (59) accepté seulement si proche de la frontière Aisne
+NORD_PROCHES = [
+    "awoingt", "quiévy", "quievy", "cambrai", "caudry",
+    "fourmies", "maubeuge", "colleret", "maing", "valenciennes",
+    "aulnoy", "trith", "bousies"
+]
+MOIS_NUM = {
+    "janvier": 1, "février": 2, "mars": 3, "avril": 4, "mai": 5, "juin": 6,
+    "juillet": 7, "août": 8, "septembre": 9, "octobre": 10, "novembre": 11, "décembre": 12
+}
+
+
+def ensure_courses_sheet():
+    svc   = get_sheets_service()
+    meta  = svc.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
+    titles = [s["properties"]["title"] for s in meta.get("sheets", [])]
+    if COURSES_SHEET in titles:
+        return
+    svc.spreadsheets().batchUpdate(
+        spreadsheetId=SPREADSHEET_ID,
+        body={"requests": [{"addSheet": {"properties": {"title": COURSES_SHEET}}}]}
+    ).execute()
+    svc.spreadsheets().values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"'{COURSES_SHEET}'!A1:E1",
+        valueInputOption="RAW",
+        body={"values": [["Date", "Lieux", "Distance", "Autres informations", "Statut"]]}
+    ).execute()
+    print(f"  ✅ Onglet '{COURSES_SHEET}' créé.")
+
+
+def get_existing_courses():
+    svc = get_sheets_service()
+    res = svc.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"'{COURSES_SHEET}'!A:E"
+    ).execute()
+    rows = res.get("values", [])
+    existing = set()
+    for r in rows[1:]:
+        lieux  = r[1].strip().lower() if len(r) > 1 else ""
+        autres = r[3].strip().lower() if len(r) > 3 else ""
+        existing.add(f"{lieux}|{autres[:40]}")
+    return existing
+
+
+def add_courses_to_sheet(courses):
+    if not courses:
+        return
+    svc    = get_sheets_service()
+    values = [
+        [c["date"], c["lieux"], c["distance"], c["info"], "nouveau"]
+        for c in courses
+    ]
+    svc.spreadsheets().values().append(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"'{COURSES_SHEET}'!A:E",
+        valueInputOption="RAW",
+        insertDataOption="INSERT_ROWS",
+        body={"values": values}
+    ).execute()
+
+
+def scrape_jogging_plus(url):
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        import subprocess
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "beautifulsoup4",
+             "--break-system-packages", "-q"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        from bs4 import BeautifulSoup
+
+    ua   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    resp = requests.get(url, headers={"User-Agent": ua}, timeout=30)
+    soup = BeautifulSoup(resp.text, "html.parser")
+    today   = date.today()
+    results = []
+
+    for table in soup.find_all("table"):
+        for row in table.find_all("tr"):
+            cells = row.find_all("td")
+            if len(cells) < 3:
+                continue
+            date_txt   = cells[0].get_text(strip=True)
+            name_el    = cells[1].find("a")
+            name       = (name_el.get_text(strip=True) if name_el
+                          else cells[1].get_text(strip=True).split("\n")[0].strip())
+            link       = (name_el["href"] if name_el and name_el.get("href") else "")
+            cell_lines = [l.strip() for l in cells[1].get_text(separator="\n").splitlines() if l.strip()]
+            distance   = " / ".join(cell_lines[1:]) if len(cell_lines) > 1 else ""
+            location   = cells[2].get_text(strip=True)
+
+            if not name or "Aucune" in name:
+                continue
+
+            # Filtrage géographique
+            is_prio = any(dept in location for dept in DEPTS_PRIORITAIRES)
+            is_nord = ("(59 " in location and
+                       any(v in location.lower() for v in NORD_PROCHES))
+            if not is_prio and not is_nord:
+                continue
+
+            # Filtrage temporel — ignorer les dates passées
+            if date_txt and date_txt.lower() not in ("non connue", "à confirmer", ""):
+                past = False
+                for mois_fr, mois_num in MOIS_NUM.items():
+                    if mois_fr in date_txt.lower():
+                        m = re.search(r"(\d{1,2})", date_txt)
+                        if m:
+                            try:
+                                d_race = date(today.year, mois_num, int(m.group(1)))
+                                if d_race < today:
+                                    past = True
+                            except Exception:
+                                pass
+                        break
+                if past:
+                    continue
+
+            results.append({
+                "date":     date_txt if date_txt else "À confirmer",
+                "lieux":    location,
+                "distance": distance or "Voir détail",
+                "info":     f"{name} | {link}" if link else name,
+                "key":      f"{location.lower()}|{name.lower()[:40]}",
+            })
+
+    return results
+
+
+def run_scrape_races():
+    print(f"🏃 Scraping des courses — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    ensure_courses_sheet()
+    existing = get_existing_courses()
+    all_new  = []
+
+    for url in [JOGGING_PLUS_HDF, JOGGING_PLUS_GRAND_EST]:
+        print(f"  → {url}")
+        try:
+            races = scrape_jogging_plus(url)
+            print(f"     {len(races)} course(s) dans le périmètre")
+            for r in races:
+                if r["key"] not in existing:
+                    all_new.append(r)
+                    existing.add(r["key"])
+        except Exception as e:
+            print(f"  ❌ Erreur : {e}")
+
+    if not all_new:
+        print("  ✅ Aucune nouvelle course.")
+        return
+
+    add_courses_to_sheet(all_new)
+    print(f"  ✅ {len(all_new)} nouvelle(s) course(s) ajoutée(s).")
+
+    lines = [f"• **{r['date']}** — {r['lieux']} — {r['distance']}" for r in all_new[:15]]
+    if len(all_new) > 15:
+        lines.append(f"... et {len(all_new) - 15} autres")
+    send_message(
+        f"📅 **{len(all_new)} nouvelle(s) course(s)** ajoutée(s) au calendrier !\n"
+        + "\n".join(lines)
+    )
+
+
+# ──────────────────────────────────────────────
+# ENTRY POINT
+# ──────────────────────────────────────────────
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--reminder",         action="store_true")
+    parser.add_argument("--check",            action="store_true")
+    parser.add_argument("--process-commands", action="store_true")
+    parser.add_argument("--scrape-races",     action="store_true")
+    args = parser.parse_args()
+
+    if args.reminder:
+        run_reminder()
+    elif args.check:
+        run_check()
+    elif args.process_commands:
+        run_process_commands()
+    elif args.scrape_races:
+        run_scrape_races()
+    else:
+        print("Usage: sport_bot.py --reminder | --check | --process-commands | --scrape-races")
+        sys.exit(1)

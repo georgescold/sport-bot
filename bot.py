@@ -239,6 +239,7 @@ async def on_ready():
     print(f"✅ Connecté : {bot.user}")
     weekly_summary_task.start()
     evening_check_task.start()
+    check_new_courses_task.start()
     await bot.change_presence(
         status=discord.Status.online,
         activity=discord.Activity(type=discord.ActivityType.watching,
@@ -386,6 +387,116 @@ async def weekly_summary_task():
 
 @weekly_summary_task.before_loop
 async def before_weekly():
+    await bot.wait_until_ready()
+
+
+
+# ── COURSES ───────────────────────────────────────────────────────────────────
+COURSES_SHEET = "Courses"
+
+
+def get_course_rows():
+    r = sheets_svc().spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"'{COURSES_SHEET}'!A:E"
+    ).execute()
+    return r.get("values", [])
+
+
+def update_course_status(row_idx: int, status: str):
+    """Met à jour la colonne Statut (E) d'une course — row_idx 0-based."""
+    sheets_svc().spreadsheets().values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"'{COURSES_SHEET}'!E{row_idx + 1}",
+        valueInputOption="RAW",
+        body={"values": [[status]]}
+    ).execute()
+
+
+class CourseView(ui.View):
+    def __init__(self, row_index: int, nom: str):
+        super().__init__(timeout=None)
+        self.row_index = row_index
+        self.nom       = nom
+        btn_oui = ui.Button(
+            label="👍 Oui, ça m'intéresse !",
+            style=discord.ButtonStyle.success,
+            custom_id=f"course_oui_{row_index}"
+        )
+        btn_non = ui.Button(
+            label="👎 Non merci",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"course_non_{row_index}"
+        )
+        btn_oui.callback = self._oui
+        btn_non.callback = self._non
+        self.add_item(btn_oui)
+        self.add_item(btn_non)
+
+    async def _oui(self, interaction: discord.Interaction):
+        await asyncio.to_thread(update_course_status, self.row_index, "oui")
+        await interaction.response.edit_message(
+            content=f"✅ **{self.nom}**\nNotée comme intéressante ! 🏅 Pense à t'inscrire.",
+            view=None
+        )
+
+    async def _non(self, interaction: discord.Interaction):
+        await asyncio.to_thread(update_course_status, self.row_index, "non")
+        await interaction.response.edit_message(
+            content=f"❌ **{self.nom}**\nPas pour toi, c'est noté. 👍",
+            view=None
+        )
+
+
+# ── TÂCHE 3 : NOTIFICATIONS NOUVELLES COURSES ────────────────────────────────
+@tasks.loop(minutes=20)
+async def check_new_courses_task():
+    """Vérifie l'onglet Courses et notifie pour chaque course avec statut 'nouveau'."""
+    channel = bot.get_channel(DISCORD_CHANNEL_ID)
+    if not channel:
+        return
+    try:
+        rows = await asyncio.to_thread(get_course_rows)
+    except Exception:
+        return
+
+    for i, row in enumerate(rows):
+        if not row or len(row) < 5:
+            continue
+        if row[4].strip().lower() != "nouveau":
+            continue
+
+        date_txt = row[0].strip() if len(row) > 0 else "Date à confirmer"
+        lieux    = row[1].strip() if len(row) > 1 else ""
+        distance = row[2].strip() if len(row) > 2 else ""
+        info     = row[3].strip() if len(row) > 3 else ""
+
+        # Séparer nom et lien (format : "Nom de la course | https://...")
+        nom, lien = info, ""
+        if " | " in info:
+            parts = info.split(" | ", 1)
+            nom, lien = parts[0].strip(), parts[1].strip()
+
+        lien_txt = f"\n🔗 {lien}" if lien else ""
+        content  = (
+            f"🏃 <@{DISCORD_USER_ID}> Nouvelle course à proximité !\n\n"
+            f"**{nom}**\n"
+            f"📅 {date_txt}\n"
+            f"📍 {lieux}\n"
+            f"🎽 {distance}{lien_txt}\n\n"
+            f"Tu t'inscris ? 👇"
+        )
+
+        # Marquer notifié AVANT d'envoyer pour éviter les doublons si le bot redémarre
+        await asyncio.to_thread(update_course_status, i, "notifié")
+
+        view = CourseView(i, nom)
+        await channel.send(content=content, view=view)
+        await asyncio.sleep(3)  # pause entre les messages
+
+
+@check_new_courses_task.before_loop
+async def before_courses():
     await bot.wait_until_ready()
 
 
