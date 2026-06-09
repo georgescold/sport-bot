@@ -18,7 +18,6 @@ from discord.ext import commands, tasks
 from discord import ui
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-import anthropic as anthropic_sdk
 
 import matplotlib
 matplotlib.use("Agg")
@@ -31,7 +30,6 @@ DISCORD_USER_ID    = int(os.environ["DISCORD_USER_ID"])
 SPREADSHEET_ID     = os.environ["SPREADSHEET_ID"]
 SHEET_NAME         = "Données Loys"  # NE JAMAIS écrire dans "Données Nico"
 SA_JSON            = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
-ANTHROPIC_API_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
 
 PARIS = ZoneInfo("Europe/Paris")
 
@@ -282,82 +280,33 @@ async def cmd_programme(ctx, *, args: str = ""):
     await ctx.reply(f"✅ **{affiche}** → **{seance}**\nC'est noté dans ton plan 📋")
 
 
+COMMANDS_SHEET = "Commandes"
+
 @bot.command(name="claude")
 async def cmd_claude(ctx, *, request: str = ""):
-    """!claude <demande> → modification naturelle du Google Sheet via IA."""
+    """!claude <demande> → enregistre dans l'onglet Commandes pour traitement Cowork."""
     if ctx.channel.id != DISCORD_CHANNEL_ID: return
     if not request:
         await ctx.reply(
             "Dis-moi ce que tu veux modifier ! 💬\n"
             "Ex: `!claude j'ai oublié mes km du lundi 3 juin, c'était 8.5 km`\n"
             "Ex: `!claude mon ressenti du 5 juin : FC moy 148, jambes lourdes`\n"
-            "Ex: `!claude la séance du 10 juin était en fait un footing 45min`"
+            "Ex: `!claude la séance du 10 juin était un footing 45min`"
         )
         return
-
-    async with ctx.typing():
-        rows      = await asyncio.to_thread(get_rows)
-        sheet_ctx = format_sheet_context(rows)
-
-        system_prompt = (
-            f"Tu es l'assistant sport de Loys (objectif sub-38 sur 10km).\n"
-            f"Tu gères son Google Sheet de suivi. Colonnes :\n"
-            f"- A (index 0) : Date ISO — NE PAS MODIFIER\n"
-            f"- B (index 1) : Jour — NE PAS MODIFIER\n"
-            f"- C (index 2) : Séance programmée\n"
-            f"- F (index 5) : Ressentis + FC\n"
-            f"- H (index 7) : Km réalisés (nombre décimal)\n"
-            f"- J (index 9) : Km semaine — NE PAS MODIFIER\n\n"
-            f"Réponds UNIQUEMENT avec un JSON valide, aucun texte autour :\n"
-            '{{"actions":[{{"date":"YYYY-MM-DD","col":<int>,"value":"<valeur>","reason":"<explication>"}}],"message":"<confirmation française>"}}\n\n'
-            f"RÈGLES : ne jamais toucher cols 0, 1, 9. Si ambigu : actions vide + explication.\n"
-            f"Aujourd'hui : {date.today().isoformat()}"
-        )
-        user_msg = f"Sheet (60 dernières lignes) :\n{sheet_ctx}\n\nDemande : \"{request}\""
-
-        try:
-            client = anthropic_sdk.Anthropic(api_key=ANTHROPIC_API_KEY)
-            resp   = client.messages.create(
-                model="claude-haiku-4-5-20251001",
-                max_tokens=1024,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_msg}]
-            )
-            raw        = resp.content[0].text.strip()
-            json_match = re.search(r'\{.*\}', raw, re.DOTALL)
-            result     = json.loads(json_match.group() if json_match else raw)
-        except Exception as e:
-            await ctx.reply(f"❌ Erreur IA : {e}")
-            return
-
-        actions = result.get("actions", [])
-        message = result.get("message", "Action effectuée.")
-
-        if not actions:
-            await ctx.reply(f"ℹ️ {message}")
-            return
-
-        errors = []
-        for action in actions:
-            row_idx = find_row(rows, action["date"])
-            if row_idx is None:
-                errors.append(f"Date {action['date']} introuvable.")
-                continue
-            col = int(action["col"])
-            if col in [0, 1, 9]:
-                errors.append(f"Colonne {col} protégée.")
-                continue
-            try:
-                await asyncio.to_thread(write_cell, row_idx, col, str(action["value"]))
-            except Exception as e:
-                errors.append(str(e))
-
-        reply = f"✅ {message}"
-        if errors:
-            reply += f"\n⚠️ {'; '.join(errors)}"
-        await ctx.reply(reply)
-
-
+    try:
+        ts  = datetime.datetime.now(PARIS).strftime("%Y-%m-%d %H:%M")
+        svc = sheets_svc()
+        svc.spreadsheets().values().append(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"'{COMMANDS_SHEET}'!A:C",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [[ts, request, "pending"]]}
+        ).execute()
+        await ctx.reply("✍️ Demande reçue ! Je la traite dans quelques minutes... ⏳")
+    except Exception as e:
+        await ctx.reply(f"❌ Erreur : {e}")
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandNotFound): return
