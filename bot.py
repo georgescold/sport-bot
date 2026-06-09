@@ -239,6 +239,7 @@ async def on_ready():
     print(f"✅ Connecté : {bot.user}")
     weekly_summary_task.start()
     evening_check_task.start()
+    check_new_courses_task.start()
     await bot.change_presence(
         status=discord.Status.online,
         activity=discord.Activity(type=discord.ActivityType.watching,
@@ -393,3 +394,209 @@ async def before_weekly():
 # ── LANCEMENT ─────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     bot.run(DISCORD_BOT_TOKEN)
+
+# ── COURSES ───────────────────────────────────────────────────────────────────
+COURSES_SHEET = "Courses"
+MOIS_BOT = {
+    "janvier":1,"février":2,"mars":3,"avril":4,"mai":5,"juin":6,
+    "juillet":7,"août":8,"septembre":9,"octobre":10,"novembre":11,"décembre":12
+}
+
+def get_course_rows():
+    r = sheets_svc().spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"'{COURSES_SHEET}'!A:E"
+    ).execute()
+    return r.get("values", [])
+
+def update_course_status(row_idx: int, status: str):
+    sheets_svc().spreadsheets().values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"'{COURSES_SHEET}'!E{row_idx + 1}",
+        valueInputOption="RAW",
+        body={"values": [[status]]}
+    ).execute()
+
+def parse_race_date(date_txt: str):
+    import re as _re
+    for m_fr, m_num in MOIS_BOT.items():
+        if m_fr in date_txt.lower():
+            match = _re.search(r'(\d{1,2})', date_txt)
+            if match:
+                day = int(match.group(1))
+                try:
+                    d = date(date.today().year, m_num, day)
+                    if d < date.today():
+                        d = date(date.today().year + 1, m_num, day)
+                    return d
+                except Exception:
+                    return None
+    return None
+
+def detect_conflicts(rows):
+    """Retourne les paires (idx_a, nom_a, date_a_txt, idx_b, nom_b, date_b_txt) en conflit."""
+    oui = []
+    for i, row in enumerate(rows):
+        if not row or len(row) < 5:
+            continue
+        if row[4].strip().lower() != "oui":
+            continue
+        d = parse_race_date(row[0].strip())
+        if not d:
+            continue
+        nom = row[3].strip().split(" | ")[0]
+        oui.append((i, nom, d, row[0].strip()))
+    conflicts = []
+    for a in range(len(oui)):
+        for b in range(a + 1, len(oui)):
+            if abs((oui[a][2] - oui[b][2]).days) < 7:
+                conflicts.append((oui[a][0], oui[a][1], oui[a][3],
+                                   oui[b][0], oui[b][1], oui[b][3]))
+    return conflicts
+
+
+class ConflictView(ui.View):
+    def __init__(self, idx_a, nom_a, date_a_txt, idx_b, nom_b, date_b_txt):
+        super().__init__(timeout=None)
+        self.idx_a, self.nom_a, self.date_a_txt = idx_a, nom_a, date_a_txt
+        self.idx_b, self.nom_b, self.date_b_txt = idx_b, nom_b, date_b_txt
+        btn_a    = ui.Button(label=f"✅ {nom_a[:28]}", style=discord.ButtonStyle.success,
+                             custom_id=f"conf_a_{idx_a}_{idx_b}")
+        btn_b    = ui.Button(label=f"✅ {nom_b[:28]}", style=discord.ButtonStyle.primary,
+                             custom_id=f"conf_b_{idx_a}_{idx_b}")
+        btn_none = ui.Button(label="❌ Retirer les deux", style=discord.ButtonStyle.danger,
+                             custom_id=f"conf_n_{idx_a}_{idx_b}")
+        btn_a.callback    = self._keep_a
+        btn_b.callback    = self._keep_b
+        btn_none.callback = self._keep_none
+        self.add_item(btn_a); self.add_item(btn_b); self.add_item(btn_none)
+
+    async def _keep_a(self, interaction):
+        await asyncio.to_thread(update_course_status, self.idx_b, "non")
+        await interaction.response.edit_message(
+            content=f"✅ **{self.nom_a}** gardée — **{self.nom_b}** retirée.", view=None)
+
+    async def _keep_b(self, interaction):
+        await asyncio.to_thread(update_course_status, self.idx_a, "non")
+        await interaction.response.edit_message(
+            content=f"✅ **{self.nom_b}** gardée — **{self.nom_a}** retirée.", view=None)
+
+    async def _keep_none(self, interaction):
+        await asyncio.to_thread(update_course_status, self.idx_a, "non")
+        await asyncio.to_thread(update_course_status, self.idx_b, "non")
+        await interaction.response.edit_message(
+            content=f"❌ **{self.nom_a}** et **{self.nom_b}** retirées.", view=None)
+
+
+async def _check_all_answered(channel):
+    """Après chaque réponse, vérifie si tout est traité → détecte les conflits."""
+    await asyncio.sleep(0.5)
+    rows = await asyncio.to_thread(get_course_rows)
+    still_pending = any(
+        r and len(r) >= 5 and r[4].strip().lower() == "notifié"
+        for r in rows
+    )
+    if still_pending:
+        return  # il reste des courses sans réponse
+
+    conflicts = detect_conflicts(rows)
+    if conflicts:
+        await channel.send(
+            f"⚠️ <@{DISCORD_USER_ID}> **{len(conflicts)} conflit(s)** détecté(s) "
+            f"— deux courses trop proches dans le temps !"
+        )
+        for (idx_a, nom_a, date_a_txt, idx_b, nom_b, date_b_txt) in conflicts:
+            # Vérifier qu'elles sont toujours "oui" (un conflit précédent a pu les retirer)
+            fresh = await asyncio.to_thread(get_course_rows)
+            if (len(fresh) <= idx_a or fresh[idx_a][4].strip().lower() != "oui" or
+                    len(fresh) <= idx_b or fresh[idx_b][4].strip().lower() != "oui"):
+                continue
+            d_a = parse_race_date(date_a_txt)
+            d_b = parse_race_date(date_b_txt)
+            delta = abs((d_a - d_b).days) if d_a and d_b else 0
+            view = ConflictView(idx_a, nom_a, date_a_txt, idx_b, nom_b, date_b_txt)
+            await channel.send(
+                content=(f"⚠️ **{nom_a}** ({date_a_txt}) et **{nom_b}** ({date_b_txt}) "
+                         f"ne sont qu'à **{delta} jour(s)** d'écart. Laquelle tu gardes ?"),
+                view=view
+            )
+            await asyncio.sleep(1)
+    else:
+        accepted = sum(
+            1 for r in rows
+            if r and len(r) >= 5 and r[4].strip().lower() == "oui"
+        )
+        if accepted > 0:
+            await channel.send(
+                f"🎉 <@{DISCORD_USER_ID}> **{accepted} course(s)** validée(s), aucun conflit !\n"
+                f"Dis **\"crée les rappels pour mes courses\"** sur Cowork pour programmer tes rappels 📅"
+            )
+
+
+class CourseView(ui.View):
+    def __init__(self, row_index: int, nom: str):
+        super().__init__(timeout=None)
+        self.row_index = row_index
+        self.nom       = nom
+        btn_oui = ui.Button(label="👍 Oui, je m'inscris !",
+                            style=discord.ButtonStyle.success,
+                            custom_id=f"course_oui_{row_index}")
+        btn_non = ui.Button(label="👎 Non merci",
+                            style=discord.ButtonStyle.secondary,
+                            custom_id=f"course_non_{row_index}")
+        btn_oui.callback = self._oui
+        btn_non.callback = self._non
+        self.add_item(btn_oui); self.add_item(btn_non)
+
+    async def _oui(self, interaction: discord.Interaction):
+        await asyncio.to_thread(update_course_status, self.row_index, "oui")
+        await interaction.response.edit_message(
+            content=f"✅ **{self.nom}** — Noté, pense à t'inscrire ! 🏅", view=None)
+        await _check_all_answered(interaction.channel)
+
+    async def _non(self, interaction: discord.Interaction):
+        await asyncio.to_thread(update_course_status, self.row_index, "non")
+        await interaction.response.edit_message(
+            content=f"❌ **{self.nom}** — Pas cette fois. 👍", view=None)
+        await _check_all_answered(interaction.channel)
+
+
+# ── TÂCHE 3 : NOTIFICATIONS NOUVELLES COURSES ────────────────────────────────
+@tasks.loop(minutes=20)
+async def check_new_courses_task():
+    """Envoie une par une les courses avec statut 'nouveau' sur Discord."""
+    channel = bot.get_channel(DISCORD_CHANNEL_ID)
+    if not channel:
+        return
+    try:
+        rows = await asyncio.to_thread(get_course_rows)
+    except Exception:
+        return
+    for i, row in enumerate(rows):
+        if not row or len(row) < 5:
+            continue
+        if row[4].strip().lower() != "nouveau":
+            continue
+        date_txt = row[0].strip()
+        lieux    = row[1].strip()
+        distance = row[2].strip()
+        info     = row[3].strip()
+        nom, lien = info, ""
+        if " | " in info:
+            parts    = info.split(" | ", 1)
+            nom, lien = parts[0].strip(), parts[1].strip()
+        lien_txt = f"\n🔗 {lien}" if lien else ""
+        content  = (
+            f"🏃 <@{DISCORD_USER_ID}> Nouvelle course à proximité !\n\n"
+            f"**{nom}**\n📅 {date_txt}\n📍 {lieux}\n🎽 {distance}{lien_txt}\n\n"
+            f"Tu t'inscris ? 👇"
+        )
+        await asyncio.to_thread(update_course_status, i, "notifié")
+        view = CourseView(i, nom)
+        await channel.send(content=content, view=view)
+        await asyncio.sleep(3)
+
+
+@check_new_courses_task.before_loop
+async def before_courses():
+    await bot.wait_until_ready()
