@@ -119,6 +119,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 @bot.event
 async def on_ready():
     print(f"✅ Connecté : {bot.user}")
+    weekly_summary_task.start()
     await bot.change_presence(
         status=discord.Status.online,
         activity=discord.Activity(type=discord.ActivityType.watching,
@@ -180,3 +181,151 @@ async def on_command_error(ctx, error):
     print(f"Erreur : {error}")
 
 bot.run(DISCORD_BOT_TOKEN)
+
+# ─────────────────────────────────────────────
+# RÉSUMÉ HEBDOMADAIRE — tous les dimanches à 21h
+# ─────────────────────────────────────────────
+import io
+import datetime
+from zoneinfo import ZoneInfo
+from discord.ext import tasks
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
+
+COL_KM_SEMAINE = 9   # J
+
+PARIS = ZoneInfo("Europe/Paris")
+
+def get_weekly_data():
+    """
+    Retourne :
+      - weeks      : liste de (label_semaine, km_total, nb_seances)
+                     sur les 16 dernières semaines
+      - this_week  : dict avec stats de la semaine en cours
+    """
+    rows = get_rows()
+    today = date.today()
+
+    # Semaine ISO en cours : lundi → dimanche
+    week_start = today - datetime.timedelta(days=today.weekday())  # lundi
+    week_end   = week_start + datetime.timedelta(days=6)           # dimanche
+
+    # Remonter 16 semaines en arrière
+    weeks = {}
+    for row in rows[1:]:   # skip header
+        if not row or not row[0].strip():
+            continue
+        try:
+            d = date.fromisoformat(row[0].strip())
+        except ValueError:
+            continue
+
+        # km journée
+        km_val = 0.0
+        if len(row) > COL_KM_JOUR and row[COL_KM_JOUR].strip():
+            try:
+                km_val = float(row[COL_KM_JOUR].strip().replace(",", "."))
+            except ValueError:
+                pass
+
+        # Séance faite ?
+        seance = row[COL_SEANCE].strip() if len(row) > COL_SEANCE else ""
+        is_rest = "repos" in seance.lower() or seance == "" or "Non réalisée" in seance
+
+        iso_week = d.isocalendar()[:2]   # (année, semaine)
+        if iso_week not in weeks:
+            weeks[iso_week] = {"km": 0.0, "seances": 0, "start": d - datetime.timedelta(days=d.weekday())}
+        weeks[iso_week]["km"]      += km_val
+        if km_val > 0 or (not is_rest and seance):
+            weeks[iso_week]["seances"] += 1
+
+    # Garder les 16 dernières semaines
+    sorted_weeks = sorted(weeks.items())[-16:]
+
+    # Stats semaine en cours
+    current_iso = today.isocalendar()[:2]
+    this_week   = weeks.get(current_iso, {"km": 0.0, "seances": 0})
+
+    return sorted_weeks, this_week, week_start, week_end
+
+
+def generate_chart(sorted_weeks) -> io.BytesIO:
+    """Génère un graphique Strava-like et retourne un buffer PNG."""
+    labels = []
+    kms    = []
+
+    for (yr, wk), data in sorted_weeks:
+        s = data["start"]
+        labels.append(s.strftime("%-d %b").lower())
+        kms.append(data["km"])
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    fig.patch.set_facecolor("#1c1c1e")
+    ax.set_facecolor("#1c1c1e")
+
+    x = range(len(labels))
+    bars = ax.bar(x, kms, color="#FC4C02", width=0.6, zorder=3)
+
+    # Mettre la dernière barre (semaine en cours) plus claire
+    if bars:
+        bars[-1].set_color("#FF8C6B")
+
+    # Valeurs au-dessus des barres
+    for bar, km in zip(bars, kms):
+        if km > 0:
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.3,
+                    f"{km:.0f}", ha="center", va="bottom",
+                    color="white", fontsize=8, fontweight="bold")
+
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(labels, rotation=45, ha="right", color="#aaaaaa", fontsize=8)
+    ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda v, _: f"{v:.0f} km"))
+    ax.tick_params(colors="#aaaaaa")
+    ax.spines[:].set_visible(False)
+    ax.yaxis.set_tick_params(labelcolor="#aaaaaa")
+    ax.grid(axis="y", color="#333333", linewidth=0.5, zorder=0)
+    ax.set_title("📈 Progression km — 16 dernières semaines",
+                 color="white", fontsize=12, pad=12)
+
+    plt.tight_layout()
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=150, facecolor="#1c1c1e")
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+@tasks.loop(time=datetime.time(hour=21, minute=0, tzinfo=PARIS))
+async def weekly_summary_task():
+    """S'exécute tous les jours à 21h Paris — n'agit que le dimanche."""
+    if date.today().weekday() != 6:
+        return
+
+    channel = bot.get_channel(DISCORD_CHANNEL_ID)
+    if not channel:
+        return
+
+    sorted_weeks, this_week, week_start, week_end = await asyncio.to_thread(get_weekly_data)
+
+    km    = this_week["km"]
+    nb    = this_week["seances"]
+    debut = week_start.strftime("%d/%m")
+    fin   = week_end.strftime("%d/%m")
+
+    texte = (
+        f"📊 **Résumé de la semaine — {debut} au {fin}**\n\n"
+        f"🏃 **{km:.1f} km** parcourus cette semaine\n"
+        f"✅ **{nb} séance(s)** réalisée(s)\n\n"
+        f"<@{DISCORD_USER_ID}> Belle semaine, continue comme ça ! 💪"
+    )
+
+    buf = await asyncio.to_thread(generate_chart, sorted_weeks)
+    file = discord.File(buf, filename="progression_km.png")
+    await channel.send(content=texte, file=file)
+
+
+@weekly_summary_task.before_loop
+async def before_weekly():
+    await bot.wait_until_ready()

@@ -4,3 +4,4 @@ google-auth-httplib2==0.2.0
 google-api-python-client==2.126.0
 discord.py==2.3.2
 aiohttp==3.9.5
+matplotlib==3.9.0
