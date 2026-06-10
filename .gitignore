@@ -1,6 +1,7 @@
 .env
 *.json
 !vercel.json
+!.claude/settings.json
 __pycache__/
 *.pyc
 .env.local

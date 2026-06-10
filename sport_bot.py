@@ -75,6 +75,15 @@ def get_sheets_service():
         SERVICE_ACCOUNT_FILE,
         scopes=["https://www.googleapis.com/auth/spreadsheets"]
     )
+    # Les sandbox cloud (Claude Code web) interceptent le TLS via un proxy dont
+    # le CA n'est connu que du bundle système ; httplib2 ne le lit pas par défaut.
+    ca_bundle = os.environ.get("REQUESTS_CA_BUNDLE") or os.environ.get("SSL_CERT_FILE")
+    if ca_bundle and os.path.exists(ca_bundle):
+        import httplib2
+        import google_auth_httplib2
+        authed_http = google_auth_httplib2.AuthorizedHttp(
+            creds, http=httplib2.Http(ca_certs=ca_bundle))
+        return build("sheets", "v4", http=authed_http, cache_discovery=False)
     return build("sheets", "v4", credentials=creds)
 
 
@@ -835,10 +844,24 @@ def run_scrape_races():
     lines = [f"• **{r['date']}** — {r['lieux']} — {r['distance']}" for r in all_new[:15]]
     if len(all_new) > 15:
         lines.append(f"... et {len(all_new) - 15} autres")
-    send_message(
-        f"📅 **{len(all_new)} nouvelle(s) course(s)** ajoutée(s) au calendrier !\n"
-        + "\n".join(lines)
-    )
+    # Bouton "Voir mes courses" : le clic est géré par le bot Railway
+    # (StartCoursesView, custom_id "start_courses_presentation").
+    send_payload({
+        "content": (
+            f"📅 <@{USER_ID}> **{len(all_new)} nouvelle(s) course(s)** ajoutée(s) au calendrier !\n"
+            + "\n".join(lines)
+            + "\n\nClique pour les passer en revue une par une 👇"
+        ),
+        "components": [{
+            "type": 1,
+            "components": [{
+                "type": 2,
+                "style": 3,
+                "label": "🏃 Voir mes courses",
+                "custom_id": "start_courses_presentation"
+            }]
+        }]
+    })
 
 
 # ──────────────────────────────────────────────
