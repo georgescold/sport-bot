@@ -75,6 +75,15 @@ def get_sheets_service():
         SERVICE_ACCOUNT_FILE,
         scopes=["https://www.googleapis.com/auth/spreadsheets"]
     )
+    # Les sandbox cloud (Claude Code web) interceptent le TLS via un proxy dont
+    # le CA n'est connu que du bundle système ; httplib2 ne le lit pas par défaut.
+    ca_bundle = os.environ.get("REQUESTS_CA_BUNDLE") or os.environ.get("SSL_CERT_FILE")
+    if ca_bundle and os.path.exists(ca_bundle):
+        import httplib2
+        import google_auth_httplib2
+        authed_http = google_auth_httplib2.AuthorizedHttp(
+            creds, http=httplib2.Http(ca_certs=ca_bundle))
+        return build("sheets", "v4", http=authed_http, cache_discovery=False)
     return build("sheets", "v4", credentials=creds)
 
 
