@@ -844,10 +844,24 @@ def run_scrape_races():
     lines = [f"• **{r['date']}** — {r['lieux']} — {r['distance']}" for r in all_new[:15]]
     if len(all_new) > 15:
         lines.append(f"... et {len(all_new) - 15} autres")
-    send_message(
-        f"📅 **{len(all_new)} nouvelle(s) course(s)** ajoutée(s) au calendrier !\n"
-        + "\n".join(lines)
-    )
+    # Bouton "Voir mes courses" : le clic est géré par le bot Railway
+    # (StartCoursesView, custom_id "start_courses_presentation").
+    send_payload({
+        "content": (
+            f"📅 <@{USER_ID}> **{len(all_new)} nouvelle(s) course(s)** ajoutée(s) au calendrier !\n"
+            + "\n".join(lines)
+            + "\n\nClique pour les passer en revue une par une 👇"
+        ),
+        "components": [{
+            "type": 1,
+            "components": [{
+                "type": 2,
+                "style": 3,
+                "label": "🏃 Voir mes courses",
+                "custom_id": "start_courses_presentation"
+            }]
+        }]
+    })
 
 
 # ──────────────────────────────────────────────
