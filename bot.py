@@ -406,10 +406,6 @@ async def before_weekly():
 
 
 
-# ── LANCEMENT ─────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    bot.run(DISCORD_BOT_TOKEN)
-
 # ── COURSES ───────────────────────────────────────────────────────────────────
 COURSES_SHEET = "Courses"
 MOIS_BOT = {
@@ -628,3 +624,10 @@ class StartCoursesView(ui.View):
             view=None
         )
         await present_courses_one_by_one(interaction.channel)
+
+
+# ── LANCEMENT ─────────────────────────────────────────────────────────────────
+# Doit rester en TOUT DERNIER : bot.run() est bloquant, donc toute classe/fonction
+# définie après ne serait jamais chargée (cf. bug StartCoursesView).
+if __name__ == "__main__":
+    bot.run(DISCORD_BOT_TOKEN)
