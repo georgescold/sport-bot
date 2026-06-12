@@ -227,7 +227,13 @@ def parse_date_fr(text: str) -> str | None:
 
 
 def build_reminder_payload(seance: str, jour: str, date_fr: str, row_index: int) -> dict:
-    """Construit le payload Discord avec boutons interactifs."""
+    """Construit le payload Discord avec boutons interactifs.
+
+    Les custom_id doivent correspondre EXACTEMENT à ceux de la vue persistante
+    SeanceView du bot Railway (bot.py) qui gère les clics : `btn_valider` /
+    `btn_non_realise`. Le bot retrouve la ligne du jour dynamiquement, donc on
+    n'encode pas row_index dans le custom_id (sinon le clic reste sans réponse
+    → « Échec de l'interaction »)."""
     return {
         "content": (
             f"🏃 Hey <@{USER_ID}> ! N'oublie pas de t'entraîner ! 💪\n\n"
@@ -243,13 +249,13 @@ def build_reminder_payload(seance: str, jour: str, date_fr: str, row_index: int)
                         "type": 2,
                         "style": 3,          # vert
                         "label": "✅ Séance faite",
-                        "custom_id": f"valider_{row_index}"
+                        "custom_id": "btn_valider"
                     },
                     {
                         "type": 2,
                         "style": 4,          # rouge
                         "label": "❌ Non réalisée",
-                        "custom_id": f"non_realise_{row_index}"
+                        "custom_id": "btn_non_realise"
                     }
                 ]
             }
@@ -497,8 +503,8 @@ def run_check():
         else:
             print("  ✉️  Aucun nouveau message.")
 
-    # Les réponses aux boutons (ressentis, km, ❌) sont désormais
-    # gérées directement par le serveur Vercel (api/discord.py).
+    # Les réponses aux boutons (ressentis, km, ❌) sont désormais gérées par la
+    # vue persistante SeanceView du bot Railway (bot.py) — plus par Vercel.
     print("  ℹ️  Réponses aux boutons gérées par le bot Railway (bot.py).")
 
 # ──────────────────────────────────────────────
