@@ -6,14 +6,11 @@ Gère trois cas :
 MODE --reminder   (appelé par la tâche planifiée 17h45)
   → Lit la séance du jour dans le sheet, envoie le rappel Discord
 
-MODE --check      (appelé toutes les 30 min, 7h-22h)
-  → Détecte les commandes Discord et les réponses au rappel quotidien
-
-COMMANDES DISCORD reconnues par --check :
-  !seance              → envoie immédiatement la séance du jour (même flux que 17h45)
-  !programme <date> : <description>
-                       → écrit la séance dans le sheet pour la date indiquée
-  Réponses au rappel   → détecte ressentis + km ou ❌ et met à jour le sheet
+MODE --check      (OBSOLÈTE — conservé pour compatibilité)
+  → Les commandes !seance / !programme et les réponses au rappel sont désormais
+    gérées en TEMPS RÉEL par le bot Railway (bot.py) via le Gateway Discord
+    (+ slash commands /seance et /programme). Ce mode ne fait plus qu'avancer
+    le curseur de messages ; la routine qui l'appelle peut être mise en pause.
 """
 
 import argparse
@@ -462,50 +459,15 @@ def _write_results(state: dict, row_index: int, ressentis: str, km: str):
 def run_check():
     print(f"🔍 MODE CHECK — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
-    # Charger l'état des commandes (dernier message traité)
-    cmd_state    = load_json(CMD_STATE_FILE)
-    last_cmd_id  = cmd_state.get("last_processed_id")
-
-    # Si jamais vu de messages, partir du message le plus récent pour éviter le flood
-    if not last_cmd_id:
-        last_cmd_id = get_latest_message_id()
-        save_json(CMD_STATE_FILE, {"last_processed_id": last_cmd_id})
-        print("  ℹ️  Initialisation : dernier message ID sauvegardé.")
-        # On traite quand même les réponses au rappel si état présent
-    else:
-        # 1. Récupérer les nouveaux messages depuis la dernière vérification
-        new_messages = get_messages_after(last_cmd_id)
-
-        if new_messages:
-            print(f"  📬 {len(new_messages)} nouveau(x) message(s) à analyser.")
-            new_last_id = new_messages[-1]["id"]
-
-            for msg in new_messages:
-                content    = msg.get("content", "").strip()
-                author_id  = msg.get("author", {}).get("id", "")
-
-                # Ignorer les messages du bot lui-même
-                if msg.get("author", {}).get("bot"):
-                    continue
-
-                # Commande !seance
-                if content.lower().startswith("!seance"):
-                    handle_seance_command()
-                    # Mettre à jour le dernier ID traité après envoi
-                    new_last_id = msg["id"]
-                    break
-
-                # Commande !programme
-                if content.lower().startswith("!programme"):
-                    handle_programme_command(content)
-
-            save_json(CMD_STATE_FILE, {"last_processed_id": new_last_id})
-        else:
-            print("  ✉️  Aucun nouveau message.")
-
-    # Les réponses aux boutons (ressentis, km, ❌) sont désormais gérées par la
-    # vue persistante SeanceView du bot Railway (bot.py) — plus par Vercel.
-    print("  ℹ️  Réponses aux boutons gérées par le bot Railway (bot.py).")
+    # !seance / !programme et les boutons sont gérés en temps réel par le bot
+    # Railway (bot.py, Gateway + slash commands). Plus AUCUN traitement ici —
+    # sinon le poller répondrait une seconde fois, 30 min plus tard.
+    # On avance seulement le curseur pour éviter un retraitement massif si ce
+    # mode était réactivé un jour.
+    latest = get_latest_message_id()
+    if latest:
+        save_json(CMD_STATE_FILE, {"last_processed_id": latest})
+    print("  ℹ️  Commandes gérées en temps réel par le bot Railway — rien à faire.")
 
 # ──────────────────────────────────────────────
 # COMMANDES DISCORD (!claude) — traitement IA

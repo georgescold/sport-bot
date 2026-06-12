@@ -1,7 +1,7 @@
 """
 bot.py — Bot Discord "Road to sub 38"
-  !seance                  → séance du jour avec boutons
-  !programme <date>:<desc> → modifie le planning
+  /seance + !seance        → séance du jour avec boutons (instantané, cache du jour)
+  /programme + !programme  → modifie le planning
   !claude <demande>        → modification IA du sheet (langage naturel)
   Bouton ✅                → modale ressentis + km
   Bouton ❌                → séance non réalisée
@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 
 import discord
 from discord.ext import commands, tasks
-from discord import ui
+from discord import ui, app_commands
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
@@ -213,6 +213,7 @@ class SeanceView(ui.View):
         seance_txt = rows[row_idx][COL_SEANCE].strip() if len(rows[row_idx]) > COL_SEANCE else ""
         await asyncio.to_thread(write_cell, row_idx, COL_SEANCE,
                                 f"{seance_txt} — ❌ Non réalisée")
+        invalidate_seance_cache()
         await interaction.response.edit_message(
             content=(f"<@{DISCORD_USER_ID}> Pas de souci, c'est noté ! 💪\n"
                      f"Séance marquée comme non réalisée. À demain !"),
@@ -224,37 +225,87 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
-async def send_seance_msg(channel):
-    """Envoie le message de séance du jour avec boutons."""
+# ── CACHE SÉANCE DU JOUR ─────────────────────────────────────────────────────
+# Le process Railway est always-on : un dict en mémoire suffit. Premier appel de
+# la journée → lecture du Sheet ; appels suivants → réponse immédiate. Le cache
+# expire tout seul au changement de jour (clé = date) et est invalidé quand la
+# séance du jour est réécrite (!programme, /programme, bouton ❌).
+_seance_cache: dict = {}
+
+def invalidate_seance_cache():
+    _seance_cache.clear()
+
+async def get_today_seance() -> dict:
+    """Renvoie {"date", "row_idx", "seance", "jour"} pour aujourd'hui (avec cache)."""
     today_str = date.today().isoformat()
-    today_day = JOURS_FR[date.today().strftime("%A")]
-    date_fr   = date.today().strftime("%d/%m/%Y")
+    if _seance_cache.get("date") == today_str:
+        return _seance_cache
     rows    = await asyncio.to_thread(get_rows)
     row_idx = find_row(rows, today_str)
-    if row_idx is None:
-        await channel.send(f"<@{DISCORD_USER_ID}> Aucune séance trouvée pour aujourd'hui ({today_str}) 🤔")
-        return
-    row        = rows[row_idx]
-    seance_txt = row[COL_SEANCE].strip() if len(row) > COL_SEANCE else ""
-    jour       = row[COL_JOUR].strip()   if len(row) > COL_JOUR   else today_day
-    if not seance_txt:
-        await channel.send(f"📅 Aucune séance programmée aujourd'hui ({date_fr}).")
-        return
-    view = SeanceView()
-    await channel.send(
-        content=(f"🏃 Hey <@{DISCORD_USER_ID}> ! N'oublie pas de t'entraîner ! 💪\n\n"
-                 f"**📅 Séance — {jour} {date_fr}**\n> **{seance_txt}**\n\n"
-                 f"Clique sur un bouton une fois ta séance terminée 👇"),
-        view=view)
+    info = {"date": today_str, "row_idx": row_idx, "seance": "", "jour": ""}
+    if row_idx is not None:
+        row = rows[row_idx]
+        info["seance"] = row[COL_SEANCE].strip() if len(row) > COL_SEANCE else ""
+        info["jour"]   = (row[COL_JOUR].strip() if len(row) > COL_JOUR else ""
+                          ) or JOURS_FR[date.today().strftime("%A")]
+    _seance_cache.clear()
+    _seance_cache.update(info)
+    return _seance_cache
 
+
+async def build_seance_response():
+    """Construit (content, view) du message de séance du jour. view=None si pas de boutons."""
+    info    = await get_today_seance()
+    date_fr = date.today().strftime("%d/%m/%Y")
+    if info["row_idx"] is None:
+        return (f"<@{DISCORD_USER_ID}> Aucune séance trouvée pour aujourd'hui ({info['date']}) 🤔", None)
+    if not info["seance"]:
+        return (f"📅 Aucune séance programmée aujourd'hui ({date_fr}).", None)
+    content = (f"🏃 Hey <@{DISCORD_USER_ID}> ! N'oublie pas de t'entraîner ! 💪\n\n"
+               f"**📅 Séance — {info['jour']} {date_fr}**\n> **{info['seance']}**\n\n"
+               f"Clique sur un bouton une fois ta séance terminée 👇")
+    return (content, SeanceView())
+
+
+async def send_seance_msg(channel):
+    """Envoie le message de séance du jour avec boutons."""
+    content, view = await build_seance_response()
+    if view:
+        await channel.send(content=content, view=view)
+    else:
+        await channel.send(content=content)
+
+
+_tree_synced = False
 
 @bot.event
 async def on_ready():
+    global _tree_synced
     print(f"✅ Connecté : {bot.user}")
-    weekly_summary_task.start()
-    evening_check_task.start()
+    # on_ready peut être rappelé à chaque reconnexion Gateway → tout doit être idempotent
+    if not weekly_summary_task.is_running(): weekly_summary_task.start()
+    if not evening_check_task.is_running():  evening_check_task.start()
     bot.add_view(SeanceView())
     bot.add_view(StartCoursesView())
+    if not _tree_synced:
+        try:
+            channel = bot.get_channel(DISCORD_CHANNEL_ID)
+            if channel and channel.guild:
+                guild = discord.Object(id=channel.guild.id)
+                bot.tree.copy_global_to(guild=guild)
+                await bot.tree.sync(guild=guild)
+                print("✅ Slash commands synchronisées sur le serveur")
+            else:
+                await bot.tree.sync()
+                print("✅ Slash commands synchronisées (global — propagation < 1 h)")
+            _tree_synced = True
+        except Exception as e:
+            print(f"⚠️ Sync slash commands impossible : {e}")
+    # Pré-chauffe le cache du jour pour que le premier /seance soit instantané
+    try:
+        await get_today_seance()
+    except Exception as e:
+        print(f"⚠️ Pré-chargement séance du jour : {e}")
     await bot.change_presence(
         status=discord.Status.online,
         activity=discord.Activity(type=discord.ActivityType.watching,
@@ -270,6 +321,25 @@ async def cmd_seance(ctx):
     await send_seance_msg(ctx.channel)
 
 
+async def apply_programme(date_raw: str, seance: str) -> str:
+    """Écrit une séance dans le planning, renvoie le message de confirmation/erreur."""
+    date_iso = parse_date(date_raw)
+    if not date_iso:
+        return f"Date `{date_raw}` non reconnue. Essaie `16 juin`, `16/06` ou `2026-06-16`."
+    rows    = await asyncio.to_thread(get_rows)
+    row_idx = find_row(rows, date_iso)
+    if row_idx is None:
+        return f"Aucune ligne trouvée pour **{date_raw}** ({date_iso}) dans le planning."
+    await asyncio.to_thread(write_cell, row_idx, COL_SEANCE, seance)
+    if date_iso == date.today().isoformat():
+        invalidate_seance_cache()
+    try:
+        d = date.fromisoformat(date_iso)
+        affiche = f"{JOURS_FR[d.strftime('%A')]} {d.strftime('%d/%m/%Y')}"
+    except: affiche = date_iso
+    return f"✅ **{affiche}** → **{seance}**\nC'est noté dans ton plan 📋"
+
+
 @bot.command(name="programme")
 async def cmd_programme(ctx, *, args: str = ""):
     """!programme <date> : <séance> → modifie une ligne du planning."""
@@ -278,22 +348,43 @@ async def cmd_programme(ctx, *, args: str = ""):
     if not m:
         await ctx.reply("Format : `!programme <date> : <séance>`\nEx: `!programme mardi 16 juin : footing 30min`")
         return
-    date_raw, seance = m.group(1).strip(), m.group(2).strip()
-    date_iso = parse_date(date_raw)
-    if not date_iso:
-        await ctx.reply(f"Date `{date_raw}` non reconnue. Essaie `16 juin`, `16/06` ou `2026-06-16`.")
+    await ctx.reply(await apply_programme(m.group(1).strip(), m.group(2).strip()))
+
+
+# ── SLASH COMMANDS (instantanées — interactions, comme les boutons) ──────────
+@bot.tree.command(name="seance", description="Affiche la séance du jour avec les boutons de validation")
+async def slash_seance(interaction: discord.Interaction):
+    if interaction.channel_id != DISCORD_CHANNEL_ID:
+        await interaction.response.send_message(
+            "❌ Cette commande ne fonctionne que dans le salon d'entraînement.", ephemeral=True)
         return
-    rows    = await asyncio.to_thread(get_rows)
-    row_idx = find_row(rows, date_iso)
-    if row_idx is None:
-        await ctx.reply(f"Aucune ligne trouvée pour **{date_raw}** ({date_iso}) dans le planning.")
+    if _seance_cache.get("date") == date.today().isoformat():
+        # Cache chaud → réponse directe, largement sous les 3 s imposées par Discord
+        content, view = await build_seance_response()
+        if view:
+            await interaction.response.send_message(content=content, view=view)
+        else:
+            await interaction.response.send_message(content=content)
+    else:
+        # Premier appel de la journée → defer (accusé immédiat), puis lecture Sheet
+        await interaction.response.defer()
+        content, view = await build_seance_response()
+        if view:
+            await interaction.followup.send(content=content, view=view)
+        else:
+            await interaction.followup.send(content=content)
+
+
+@bot.tree.command(name="programme", description="Programme ou modifie une séance du planning")
+@app_commands.describe(date="Date de la séance (ex : 16 juin, 16/06 ou 2026-06-16)",
+                       seance="Description de la séance (ex : footing 30min)")
+async def slash_programme(interaction: discord.Interaction, date: str, seance: str):
+    if interaction.channel_id != DISCORD_CHANNEL_ID:
+        await interaction.response.send_message(
+            "❌ Cette commande ne fonctionne que dans le salon d'entraînement.", ephemeral=True)
         return
-    await asyncio.to_thread(write_cell, row_idx, COL_SEANCE, seance)
-    try:
-        d = date.fromisoformat(date_iso)
-        affiche = f"{JOURS_FR[d.strftime('%A')]} {d.strftime('%d/%m/%Y')}"
-    except: affiche = date_iso
-    await ctx.reply(f"✅ **{affiche}** → **{seance}**\nC'est noté dans ton plan 📋")
+    await interaction.response.defer()
+    await interaction.followup.send(await apply_programme(date, seance))
 
 
 COMMANDS_SHEET = "Commandes"
