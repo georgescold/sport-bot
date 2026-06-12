@@ -1,7 +1,7 @@
 """
 bot.py — Bot Discord "Road to sub 38"
-  /seance + !seance        → séance du jour avec boutons (instantané, cache du jour)
-  /programme + !programme  → modifie le planning
+  !seance                  → séance du jour avec boutons (instantané, cache du jour)
+  !programme <date> : <s>  → modifie le planning
   !claude <demande>        → modification IA du sheet (langage naturel)
   Bouton ✅                → modale ressentis + km
   Bouton ❌                → séance non réalisée
@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 
 import discord
 from discord.ext import commands, tasks
-from discord import ui, app_commands
+from discord import ui
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
@@ -287,20 +287,21 @@ async def on_ready():
     if not evening_check_task.is_running():  evening_check_task.start()
     bot.add_view(SeanceView())
     bot.add_view(StartCoursesView())
+    # Les slash commands ont été retirées (tout passe par !seance / !programme /
+    # !claude) : on synchronise un arbre vide pour les désenregistrer de Discord.
     if not _tree_synced:
         try:
             channel = bot.get_channel(DISCORD_CHANNEL_ID)
             if channel and channel.guild:
                 guild = discord.Object(id=channel.guild.id)
-                bot.tree.copy_global_to(guild=guild)
+                bot.tree.clear_commands(guild=guild)
                 await bot.tree.sync(guild=guild)
-                print("✅ Slash commands synchronisées sur le serveur")
-            else:
-                await bot.tree.sync()
-                print("✅ Slash commands synchronisées (global — propagation < 1 h)")
+            bot.tree.clear_commands(guild=None)
+            await bot.tree.sync()
+            print("✅ Slash commands désenregistrées (menu / nettoyé)")
             _tree_synced = True
         except Exception as e:
-            print(f"⚠️ Sync slash commands impossible : {e}")
+            print(f"⚠️ Désenregistrement slash commands impossible : {e}")
     # Pré-chauffe le cache du jour pour que le premier /seance soit instantané
     try:
         await get_today_seance()
@@ -349,42 +350,6 @@ async def cmd_programme(ctx, *, args: str = ""):
         await ctx.reply("Format : `!programme <date> : <séance>`\nEx: `!programme mardi 16 juin : footing 30min`")
         return
     await ctx.reply(await apply_programme(m.group(1).strip(), m.group(2).strip()))
-
-
-# ── SLASH COMMANDS (instantanées — interactions, comme les boutons) ──────────
-@bot.tree.command(name="seance", description="Affiche la séance du jour avec les boutons de validation")
-async def slash_seance(interaction: discord.Interaction):
-    if interaction.channel_id != DISCORD_CHANNEL_ID:
-        await interaction.response.send_message(
-            "❌ Cette commande ne fonctionne que dans le salon d'entraînement.", ephemeral=True)
-        return
-    if _seance_cache.get("date") == date.today().isoformat():
-        # Cache chaud → réponse directe, largement sous les 3 s imposées par Discord
-        content, view = await build_seance_response()
-        if view:
-            await interaction.response.send_message(content=content, view=view)
-        else:
-            await interaction.response.send_message(content=content)
-    else:
-        # Premier appel de la journée → defer (accusé immédiat), puis lecture Sheet
-        await interaction.response.defer()
-        content, view = await build_seance_response()
-        if view:
-            await interaction.followup.send(content=content, view=view)
-        else:
-            await interaction.followup.send(content=content)
-
-
-@bot.tree.command(name="programme", description="Programme ou modifie une séance du planning")
-@app_commands.describe(date="Date de la séance (ex : 16 juin, 16/06 ou 2026-06-16)",
-                       seance="Description de la séance (ex : footing 30min)")
-async def slash_programme(interaction: discord.Interaction, date: str, seance: str):
-    if interaction.channel_id != DISCORD_CHANNEL_ID:
-        await interaction.response.send_message(
-            "❌ Cette commande ne fonctionne que dans le salon d'entraînement.", ephemeral=True)
-        return
-    await interaction.response.defer()
-    await interaction.followup.send(await apply_programme(date, seance))
 
 
 COMMANDS_SHEET = "Commandes"
