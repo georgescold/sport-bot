@@ -389,6 +389,25 @@ async def slash_programme(interaction: discord.Interaction, date: str, seance: s
 
 COMMANDS_SHEET = "Commandes"
 
+# Heures de passage (Paris) de la routine cloud qui traite l'onglet Commandes.
+# À garder synchro avec le cron de la routine claude.ai : 45 7,12,17,18,21 * * *
+ROUTINE_RUN_TIMES = (
+    datetime.time(7, 45), datetime.time(12, 45), datetime.time(17, 45),
+    datetime.time(18, 45), datetime.time(21, 45),
+)
+
+def next_routine_run() -> datetime.datetime:
+    """Prochain passage de la routine cloud (datetime aware, Paris)."""
+    now = datetime.datetime.now(PARIS)
+    for t in ROUTINE_RUN_TIMES:
+        run = now.replace(hour=t.hour, minute=t.minute, second=0, microsecond=0)
+        if run > now:
+            return run
+    t = ROUTINE_RUN_TIMES[0]
+    return (now + datetime.timedelta(days=1)).replace(
+        hour=t.hour, minute=t.minute, second=0, microsecond=0)
+
+
 @bot.command(name="claude")
 async def cmd_claude(ctx, *, request: str = ""):
     """!claude <demande> → enregistre dans l'onglet Commandes pour traitement Cowork."""
@@ -411,7 +430,11 @@ async def cmd_claude(ctx, *, request: str = ""):
             insertDataOption="INSERT_ROWS",
             body={"values": [[ts, request, "pending"]]}
         ).execute()
-        await ctx.reply("✍️ Demande reçue ! Je la traite dans quelques minutes... ⏳")
+        run = int(next_routine_run().timestamp())
+        await ctx.reply(
+            f"✍️ Demande reçue ! Je la traite au prochain passage de la routine : "
+            f"<t:{run}:t>, soit <t:{run}:R> ⏳"
+        )
     except Exception as e:
         await ctx.reply(f"❌ Erreur : {e}")
 @bot.event

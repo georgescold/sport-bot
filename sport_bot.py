@@ -1,24 +1,20 @@
 """
-sport_bot.py — Script unifié
------------------------------
-Gère trois cas :
+sport_bot.py — Outils de la routine cloud
+-----------------------------------------
+MODE --reminder      → envoie le rappel de séance Discord (routine, fenêtre 17h-18h)
+MODE --scrape-races  → scrape jogging-plus et alimente l'onglet « Courses »
 
-MODE --reminder   (appelé par la tâche planifiée 17h45)
-  → Lit la séance du jour dans le sheet, envoie le rappel Discord
-
-MODE --check      (OBSOLÈTE — conservé pour compatibilité)
-  → Les commandes !seance / !programme et les réponses au rappel sont désormais
-    gérées en TEMPS RÉEL par le bot Railway (bot.py) via le Gateway Discord
-    (+ slash commands /seance et /programme). Ce mode ne fait plus qu'avancer
-    le curseur de messages ; la routine qui l'appelle peut être mise en pause.
+Les helpers de l'onglet « Commandes » (ensure_commands_sheet, get_pending_commands,
+mark_command_done, format_sheet_context) sont utilisés par la routine cloud et
+apply_cmd.py. Le temps réel (boutons, /seance, /programme, !claude) est géré par
+le bot Railway (bot.py).
 """
 
 import argparse
-import json
 import os
 import re
 import sys
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 import requests
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -33,10 +29,6 @@ CHANNEL_ID           = "1513887659339288676"
 USER_ID              = "340479270449315840"
 SERVICE_ACCOUNT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         "gen-lang-client-0218641615-b114179ddeb2.json")
-STATE_FILE           = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                        "sport_state.json")
-CMD_STATE_FILE       = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                        "sport_cmd_state.json")
 
 # Colonnes (index 0-based)
 COL_DATE      = 0   # A
@@ -51,18 +43,6 @@ JOURS_FR = {
     "Monday": "Lundi", "Tuesday": "Mardi", "Wednesday": "Mercredi",
     "Thursday": "Jeudi", "Friday": "Vendredi", "Saturday": "Samedi", "Sunday": "Dimanche"
 }
-
-# Mapping jour FR → numéro weekday (lundi=0)
-JOURS_TO_WEEKDAY = {
-    "lundi": 0, "mardi": 1, "mercredi": 2, "jeudi": 3,
-    "vendredi": 4, "samedi": 5, "dimanche": 6
-}
-
-MOIS_FR = {
-    "janvier": 1, "février": 2, "mars": 3, "avril": 4, "mai": 5, "juin": 6,
-    "juillet": 7, "août": 8, "septembre": 9, "octobre": 10, "novembre": 11, "décembre": 12
-}
-
 
 # ──────────────────────────────────────────────
 # GOOGLE SHEETS
@@ -143,86 +123,6 @@ def send_payload(payload: dict) -> dict:
     return resp.json()
 
 
-def get_messages_after(after_id: str, limit: int = 50) -> list:
-    resp = requests.get(
-        f"{DISCORD_API}/channels/{CHANNEL_ID}/messages",
-        headers=discord_headers(),
-        params={"after": after_id, "limit": limit}
-    )
-    resp.raise_for_status()
-    return list(reversed(resp.json()))
-
-
-def get_latest_message_id() -> str | None:
-    """Retourne l'ID du dernier message du channel."""
-    resp = requests.get(
-        f"{DISCORD_API}/channels/{CHANNEL_ID}/messages",
-        headers=discord_headers(),
-        params={"limit": 1}
-    )
-    resp.raise_for_status()
-    msgs = resp.json()
-    return msgs[0]["id"] if msgs else None
-
-
-# ──────────────────────────────────────────────
-# STATE
-# ──────────────────────────────────────────────
-def load_json(path: str) -> dict:
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
-
-
-def save_json(path: str, data: dict):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
-# ──────────────────────────────────────────────
-# HELPERS
-# ──────────────────────────────────────────────
-def extract_km(text: str) -> str:
-    text = text.replace(",", ".").strip()
-    m = re.search(r"\b(\d+(?:\.\d+)?)\s*(?:km|kilomètres?|kms?)?\b", text, re.IGNORECASE)
-    return m.group(1) if m else text
-
-
-def parse_date_fr(text: str) -> str | None:
-    """
-    Essaie de parser une date en français vers YYYY-MM-DD.
-    Formats supportés :
-      - "lundi 16 juin"  /  "16 juin"
-      - "16/06"  /  "16/06/2026"
-      - "2026-06-16"
-    """
-    text = text.strip().lower()
-    current_year = date.today().year
-
-    # Format ISO
-    m = re.match(r"(\d{4})-(\d{2})-(\d{2})", text)
-    if m:
-        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
-
-    # Format JJ/MM ou JJ/MM/AAAA
-    m = re.match(r"(\d{1,2})/(\d{1,2})(?:/(\d{4}))?", text)
-    if m:
-        y = int(m.group(3)) if m.group(3) else current_year
-        return f"{y}-{int(m.group(2)):02d}-{int(m.group(1)):02d}"
-
-    # Format "lundi 16 juin" ou "16 juin"
-    m = re.search(r"(\d{1,2})\s+(\w+)", text)
-    if m:
-        day  = int(m.group(1))
-        mois = m.group(2).lower()
-        month = MOIS_FR.get(mois)
-        if month:
-            return f"{current_year}-{month:02d}-{day:02d}"
-
-    return None
-
-
 def build_reminder_payload(seance: str, jour: str, date_fr: str, row_index: int) -> dict:
     """Construit le payload Discord avec boutons interactifs.
 
@@ -288,189 +188,9 @@ def run_reminder():
     sent = send_payload(payload)
     print(f"✅ Message Discord envoyé (ID: {sent['id']})")
 
-    state = {
-        "message_id": sent["id"],
-        "row_index": row_idx,
-        "seance": seance,
-        "sent_at": datetime.now().isoformat(),
-        "responded": False
-    }
-    save_json(STATE_FILE, state)
-    print(f"✅ État sauvegardé → {STATE_FILE}")
-
 
 # ──────────────────────────────────────────────
-# MODE CHECK (--check)
-# ──────────────────────────────────────────────
-def handle_seance_command():
-    """!seance → envoie immédiatement la séance du jour et démarre le flux."""
-    print("  → Commande !seance détectée")
-    rows      = get_all_rows()
-    today_str = date.today().isoformat()
-    today_day = JOURS_FR[date.today().strftime("%A")]
-    row_idx   = find_row_for_date(rows, today_str)
-
-    if row_idx is None:
-        send_message(f"<@{USER_ID}> Aucune séance trouvée pour aujourd'hui ({today_str}) dans le planning. 🤔")
-        return
-
-    row    = rows[row_idx]
-    seance = row[COL_SEANCE].strip() if len(row) > COL_SEANCE else "Repos"
-    jour   = row[COL_JOUR].strip()   if len(row) > COL_JOUR   else today_day
-    date_fr = date.today().strftime("%d/%m/%Y")
-
-    payload = build_reminder_payload(seance, jour, date_fr, row_idx)
-    sent = send_payload(payload)
-
-    state = {
-        "message_id": sent["id"],
-        "row_index": row_idx,
-        "seance": seance,
-        "sent_at": datetime.now().isoformat(),
-        "responded": False
-    }
-    save_json(STATE_FILE, state)
-    print(f"  ✅ Rappel envoyé (ID: {sent['id']}) + état sauvegardé")
-
-
-def handle_programme_command(text: str):
-    """!programme <date> : <description> → écrit dans le sheet."""
-    print(f"  → Commande !programme : '{text}'")
-
-    # Parser "!programme <date> : <description>"
-    m = re.match(r"!programme\s+(.+?)\s*:\s*(.+)", text, re.IGNORECASE)
-    if not m:
-        send_message(
-            f"<@{USER_ID}> Format incorrect 🙁\n"
-            f"Utilise : `!programme <date> : <description de la séance>`\n"
-            f"Exemples :\n"
-            f"• `!programme mardi 16 juin : footing 30min`\n"
-            f"• `!programme 16/06 : vélo 1h`\n"
-            f"• `!programme 2026-06-16 : natation`"
-        )
-        return
-
-    date_raw  = m.group(1).strip()
-    seance    = m.group(2).strip()
-    date_iso  = parse_date_fr(date_raw)
-
-    if not date_iso:
-        send_message(
-            f"<@{USER_ID}> Je n'ai pas réussi à lire la date `{date_raw}` 🙁\n"
-            f"Essaie le format : `16 juin`, `16/06` ou `2026-06-16`"
-        )
-        return
-
-    rows    = get_all_rows()
-    row_idx = find_row_for_date(rows, date_iso)
-
-    if row_idx is None:
-        send_message(
-            f"<@{USER_ID}> Aucune ligne trouvée pour le **{date_raw}** ({date_iso}) dans le planning.\n"
-            f"Vérifie que cette date existe dans le Google Sheet."
-        )
-        return
-
-    service = get_sheets_service()
-    update_cell(service, row_idx, COL_SEANCE, seance)
-
-    # Formatter la date pour l'affichage
-    try:
-        d     = date.fromisoformat(date_iso)
-        jour  = JOURS_FR[d.strftime("%A")]
-        affiche = f"{jour} {d.strftime('%d/%m/%Y')}"
-    except Exception:
-        affiche = date_iso
-
-    send_message(
-        f"<@{USER_ID}> ✅ Séance programmée !\n"
-        f"**{affiche}** → **{seance}**\n"
-        f"C'est noté dans ton plan d'entraînement 📋"
-    )
-    print(f"  ✅ Séance '{seance}' écrite pour {date_iso} (ligne {row_idx + 1})")
-
-
-def process_daily_responses(state: dict):
-    """Gère les réponses au rappel quotidien (ressentis, km, ❌)."""
-    message_id = state["message_id"]
-    row_index  = state["row_index"]
-
-    messages  = get_messages_after(message_id)
-    user_msgs = [m for m in messages if m.get("author", {}).get("id") == USER_ID]
-
-    if not user_msgs:
-        print("  ⏳ Aucune réponse de l'utilisateur.")
-        return
-
-    print(f"  📨 {len(user_msgs)} message(s) utilisateur.")
-
-    # Détecter ❌
-    for msg in user_msgs:
-        content = msg.get("content", "").strip()
-        if "❌" in content or content.lower() in ("non", "pas fait", "x"):
-            print("  ❌ Séance non faite.")
-            svc = get_sheets_service()
-            update_cell(svc, row_index, COL_SEANCE, f"{state['seance']} — ❌ Non réalisée")
-            send_message(
-                f"<@{USER_ID}> Pas de souci, c'est noté ! "
-                f"Séance marquée comme non réalisée dans ton plan. 💪 À demain !"
-            )
-            state["responded"] = True
-            save_json(STATE_FILE, state)
-            return
-
-    # Cas où on avait déjà les ressentis → ce message est les km
-    if state.get("partial_ressentis") and len(user_msgs) >= 1:
-        ressentis = state["partial_ressentis"]
-        km        = extract_km(user_msgs[0].get("content", "").strip())
-        _write_results(state, row_index, ressentis, km)
-        return
-
-    # Deux messages → 1er ressentis, 2e km
-    if len(user_msgs) >= 2:
-        ressentis = user_msgs[0].get("content", "").strip()
-        km        = extract_km(user_msgs[1].get("content", "").strip())
-        _write_results(state, row_index, ressentis, km)
-        return
-
-    # Un seul message → sauvegarder ressentis, attendre km
-    if len(user_msgs) == 1:
-        ressentis = user_msgs[0].get("content", "").strip()
-        print(f"  💾 Ressentis sauvegardés, en attente des km...")
-        state["partial_ressentis"] = ressentis
-        save_json(STATE_FILE, state)
-
-
-def _write_results(state: dict, row_index: int, ressentis: str, km: str):
-    svc = get_sheets_service()
-    update_cell(svc, row_index, COL_RESSENTIS, ressentis)
-    update_cell(svc, row_index, COL_KM_JOUR,   km)
-    send_message(
-        f"<@{USER_ID}> Super, c'est noté ! 🎉\n"
-        f"**Ressentis :** {ressentis}\n"
-        f"**Km :** {km} km\n"
-        f"Bravo pour la séance ! 🏃‍♂️"
-    )
-    state["responded"] = True
-    save_json(STATE_FILE, state)
-    print(f"  ✅ Résultats écrits dans le sheet.")
-
-
-def run_check():
-    print(f"🔍 MODE CHECK — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-
-    # !seance / !programme et les boutons sont gérés en temps réel par le bot
-    # Railway (bot.py, Gateway + slash commands). Plus AUCUN traitement ici —
-    # sinon le poller répondrait une seconde fois, 30 min plus tard.
-    # On avance seulement le curseur pour éviter un retraitement massif si ce
-    # mode était réactivé un jour.
-    latest = get_latest_message_id()
-    if latest:
-        save_json(CMD_STATE_FILE, {"last_processed_id": latest})
-    print("  ℹ️  Commandes gérées en temps réel par le bot Railway — rien à faire.")
-
-# ──────────────────────────────────────────────
-# COMMANDES DISCORD (!claude) — traitement IA
+# ONGLET « COMMANDES » — helpers routine cloud + apply_cmd.py
 # ──────────────────────────────────────────────
 COMMANDS_SHEET = "Commandes"
 
@@ -540,106 +260,6 @@ def format_sheet_context(rows) -> str:
             f"Ressentis: {ress or '—'} | Km: {km or '—'}"
         )
     return "\n".join(lines[-60:])
-
-
-def run_process_commands():
-    print(f"🤖 MODE PROCESS-COMMANDS — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    ensure_commands_sheet()
-
-    pending = get_pending_commands()
-    if not pending:
-        print("  ✅ Aucune commande en attente.")
-        return
-
-    print(f"  📬 {len(pending)} commande(s) à traiter.")
-
-    main_rows = get_all_rows()
-    sheet_ctx = format_sheet_context(main_rows)
-
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        print("  ❌ ANTHROPIC_API_KEY manquante dans les variables d'environnement Cowork.")
-        return
-
-    try:
-        import anthropic as anthropic_sdk
-    except ImportError:
-        import subprocess
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "anthropic",
-             "--break-system-packages", "-q"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
-        import anthropic as anthropic_sdk
-
-    client = anthropic_sdk.Anthropic(api_key=api_key)
-
-    for sheet_row, ts, request in pending:
-        print(f'  → Traitement : "{request[:60]}..."')
-
-        system_prompt = (
-            "Tu es l'assistant sport de Loys (objectif sub-38 sur 10km).\n"
-            "Tu gères son Google Sheet de suivi. Colonnes :\n"
-            "- A (index 0) : Date ISO — NE PAS MODIFIER\n"
-            "- B (index 1) : Jour — NE PAS MODIFIER\n"
-            "- C (index 2) : Séance programmée\n"
-            "- F (index 5) : Ressentis + FC\n"
-            "- H (index 7) : Km réalisés (nombre décimal)\n"
-            "- J (index 9) : Km semaine — NE PAS MODIFIER\n\n"
-            "Réponds UNIQUEMENT avec un JSON valide, sans markdown :\n"
-            '{"actions":[{"date":"YYYY-MM-DD","col":<int>,"value":"<valeur>",'
-            '"reason":"<explication>"}],"message":"<confirmation française>"}\n\n'
-            "RÈGLES : ne jamais toucher cols 0, 1, 9. Si ambigu : actions vide + explication.\n"
-            f"Aujourd'hui : {date.today().isoformat()}"
-        )
-        user_msg = f"Sheet actuel :\n{sheet_ctx}\n\nDemande : \"{request}\""
-
-        try:
-            resp = client.messages.create(
-                model="claude-haiku-4-5-20251001",
-                max_tokens=1024,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_msg}]
-            )
-            raw = resp.content[0].text.strip()
-            json_match = re.search(r'\{.*\}', raw, re.DOTALL)
-            result_json = json.loads(json_match.group() if json_match else raw)
-        except Exception as e:
-            print(f"  ❌ Erreur IA : {e}")
-            mark_command_done(sheet_row, f"Erreur IA : {e}")
-            send_message(f"<@{USER_ID}> ❌ Erreur lors du traitement de ta demande : {e}")
-            continue
-
-        actions = result_json.get("actions", [])
-        message = result_json.get("message", "Action effectuée.")
-
-        if not actions:
-            mark_command_done(sheet_row, message)
-            send_message(f"<@{USER_ID}> ℹ️ {message}")
-            continue
-
-        svc    = get_sheets_service()
-        errors = []
-        for action in actions:
-            row_idx = find_row_for_date(main_rows, action["date"])
-            if row_idx is None:
-                errors.append(f"Date {action['date']} introuvable.")
-                continue
-            col = int(action["col"])
-            if col in [0, 1, 9]:
-                errors.append(f"Colonne {col} protégée.")
-                continue
-            try:
-                update_cell(svc, row_idx, col, str(action["value"]))
-            except Exception as e:
-                errors.append(str(e))
-
-        reply = f"✅ {message}"
-        if errors:
-            reply += f"\n⚠️ {'; '.join(errors)}"
-        mark_command_done(sheet_row, reply)
-        send_message(f"<@{USER_ID}> {reply}")
-        print(f"  ✅ Traité : {message}")
 
 
 # ──────────────────────────────────────────────
@@ -837,20 +457,14 @@ def run_scrape_races():
 # ──────────────────────────────────────────────
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--reminder",         action="store_true")
-    parser.add_argument("--check",            action="store_true")
-    parser.add_argument("--process-commands", action="store_true")
-    parser.add_argument("--scrape-races",     action="store_true")
+    parser.add_argument("--reminder",     action="store_true")
+    parser.add_argument("--scrape-races", action="store_true")
     args = parser.parse_args()
 
     if args.reminder:
         run_reminder()
-    elif args.check:
-        run_check()
-    elif args.process_commands:
-        run_process_commands()
     elif args.scrape_races:
         run_scrape_races()
     else:
-        print("Usage: sport_bot.py --reminder | --check | --process-commands | --scrape-races")
+        print("Usage: sport_bot.py --reminder | --scrape-races")
         sys.exit(1)
