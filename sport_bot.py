@@ -6,7 +6,7 @@ MODE --scrape-races  → scrape jogging-plus et alimente l'onglet « Courses »
 
 Les helpers de l'onglet « Commandes » (ensure_commands_sheet, get_pending_commands,
 mark_command_done, format_sheet_context) sont utilisés par la routine cloud et
-apply_cmd.py. Le temps réel (boutons, /seance, /programme, !claude) est géré par
+apply_cmd.py. Le temps réel (boutons, !seance, !programme, !claude) est géré par
 le bot Railway (bot.py).
 """
 
