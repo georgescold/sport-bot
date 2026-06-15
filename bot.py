@@ -115,31 +115,50 @@ def format_sheet_context(rows) -> str:
     return "\n".join(lines[-60:])
 
 # ── GRAPHIQUE STRAVA-LIKE ─────────────────────────────────────────────────────
+WEEKS_WINDOW = 13   # ~3 mois affichés (1 trimestre), 1 point = 1 semaine (vue type Strava)
+
 def get_weekly_data():
     rows  = get_rows()
     kmc   = km_jour_col(rows)
     today = date.today()
-    week_start = today - datetime.timedelta(days=today.weekday())
+    week_start = today - datetime.timedelta(days=today.weekday())   # lundi de la semaine en cours
     week_end   = week_start + datetime.timedelta(days=6)
-    weeks = {}
+
+    # Agrège km + séances par semaine (clé = lundi) en IGNORANT les semaines futures :
+    # le planning contient des lignes à venir (km=0) qui sinon tirent la courbe à droite.
+    km_by_week, seances_by_week = {}, {}
     for row in rows[1:]:
         if not row or not row[0].strip(): continue
         try: d = date.fromisoformat(row[0].strip())
         except: continue
+        wk = d - datetime.timedelta(days=d.weekday())   # lundi de la ligne
+        if wk > week_start: continue                    # semaine future → exclue
         km_val = 0.0
         if len(row) > kmc and row[kmc].strip():
             try: km_val = float(row[kmc].strip().replace(",","."))
             except: pass
         seance = row[COL_SEANCE].strip() if len(row) > COL_SEANCE else ""
-        iso_week = d.isocalendar()[:2]
-        if iso_week not in weeks:
-            weeks[iso_week] = {"km":0.0,"seances":0,"start":d-datetime.timedelta(days=d.weekday())}
-        weeks[iso_week]["km"] += km_val
-        is_rest = "repos" in seance.lower() or seance=="" or "Non réalisée" in seance
+        km_by_week[wk] = km_by_week.get(wk, 0.0) + km_val
+        is_rest = "repos" in seance.lower() or seance == "" or "Non réalisée" in seance
         if km_val > 0 or (not is_rest and seance):
-            weeks[iso_week]["seances"] += 1
-    sorted_weeks = sorted(weeks.items())[-16:]
-    this_week    = weeks.get(today.isocalendar()[:2], {"km":0.0,"seances":0})
+            seances_by_week[wk] = seances_by_week.get(wk, 0) + 1
+
+    data_weeks = sorted(km_by_week)     # semaines présentes dans le sheet (toutes ≤ semaine en cours)
+    this_week  = {"km": km_by_week.get(week_start, 0.0),
+                  "seances": seances_by_week.get(week_start, 0)}
+    if not data_weeks:
+        return [], this_week, week_start, week_end
+
+    # Fenêtre CONTINUE : finit sur la dernière semaine enregistrée, remonte ~WEEKS_WINDOW
+    # semaines, trous comblés à 0 (1 point = 1 semaine, point le plus à droite = dernière semaine).
+    right = data_weeks[-1]
+    left  = max(data_weeks[0], right - datetime.timedelta(weeks=WEEKS_WINDOW - 1))
+    sorted_weeks, wk = [], left
+    while wk <= right:
+        sorted_weeks.append((wk, {"km": km_by_week.get(wk, 0.0),
+                                  "seances": seances_by_week.get(wk, 0),
+                                  "start": wk}))
+        wk += datetime.timedelta(weeks=1)
     return sorted_weeks, this_week, week_start, week_end
 
 def generate_chart(sorted_weeks) -> io.BytesIO:
@@ -153,8 +172,7 @@ def generate_chart(sorted_weeks) -> io.BytesIO:
     BG = "#191919"; ORANGE = "#FC4C02"; GRID = "#2a2a2a"
     fig, ax = plt.subplots(figsize=(11, 4.5))
     fig.patch.set_facecolor(BG); ax.set_facecolor(BG)
-    ax.fill_between(x, kms, color=ORANGE, alpha=0.25, zorder=1)
-    ax.bar(x, kms, color=ORANGE, alpha=0.18, width=0.8, zorder=1)
+    ax.fill_between(x, kms, color=ORANGE, alpha=0.22, zorder=1)
     ax.plot(x, kms, color=ORANGE, linewidth=2.2, zorder=3)
     ax.scatter(x, kms, color=ORANGE, s=38, zorder=4, edgecolors=BG, linewidths=1.5)
     if kms:
