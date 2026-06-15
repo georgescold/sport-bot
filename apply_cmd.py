@@ -10,12 +10,21 @@ import sport_bot as sb
 
 plan = json.load(sys.stdin)
 svc, rows, applied = sb.get_sheets_service(), sb.get_all_rows(), []
+
+# Colonnes protégées en écriture : date(0/A), jour(1/B), 9, + « Notes Nico »
+# (colonne du COACH) résolue par en-tête pour rester correcte après tout décalage.
+protected = {0, 1, 9}
+for i, name in enumerate(rows[0] if rows else []):
+    n = (name or "").strip().lower()
+    if "notes" in n and "nico" in n:
+        protected.add(i)
+
 for e in plan.get("edits", []):
     idx = sb.find_row_for_date(rows, e["date"])
     if idx is None:
         applied.append("date " + e["date"] + " introuvable"); continue
     col = int(e["col"])
-    if col in (0, 1, 9):
+    if col in protected:
         applied.append("colonne " + str(col) + " protegee"); continue
     sb.update_cell(svc, idx, col, str(e["value"]))
     applied.append(chr(65 + col) + "@" + e["date"] + "=" + str(e["value"]))

@@ -30,12 +30,15 @@ USER_ID              = "340479270449315840"
 SERVICE_ACCOUNT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         "gen-lang-client-0218641615-b114179ddeb2.json")
 
-# Colonnes (index 0-based)
-COL_DATE      = 0   # A
-COL_JOUR      = 1   # B
-COL_SEANCE    = 2   # C
-COL_RESSENTIS = 5   # F
-COL_KM_JOUR   = 7   # H
+# Colonnes (index 0-based) — disposition « Données Loys » :
+# A=date B=jour C=séance … F=ressentis
+# G="Notes Nico" (colonne du COACH — NE JAMAIS écrire) H=km_journee I=km_semaine
+COL_DATE       = 0   # A
+COL_JOUR       = 1   # B
+COL_SEANCE     = 2   # C
+COL_RESSENTIS  = 5   # F
+COL_NOTES_NICO = 6   # G — coach, lecture seule
+COL_KM_JOUR    = 7   # H — fallback ; la vraie colonne est résolue par km_jour_col()
 
 DISCORD_API = "https://discord.com/api/v10"
 
@@ -68,7 +71,7 @@ def get_all_rows():
     service = get_sheets_service()
     result = service.spreadsheets().values().get(
         spreadsheetId=SPREADSHEET_ID,
-        range=f"'{SHEET_NAME}'!A:H"
+        range=f"'{SHEET_NAME}'!A:K"
     ).execute()
     return result.get("values", [])
 
@@ -93,6 +96,19 @@ def update_cell(service, row_index: int, col_index: int, value: str):
         body=body
     ).execute()
     print(f"  ✅ Sheet : {cell_range} = '{value}'")
+
+
+def km_jour_col(rows, default: int = COL_KM_JOUR) -> int:
+    """Index 0-based de la colonne « km_journee », résolu via l'en-tête (ligne 0).
+    On cible la colonne par son NOM plutôt que par un index figé : l'ajout de
+    « Notes Nico » en G a décalé les colonnes. Ne matche jamais « km_semaine ».
+    Fallback : COL_KM_JOUR (H)."""
+    if rows and rows[0]:
+        for i, raw in enumerate(rows[0]):
+            n = (raw or "").strip().lower()
+            if "km" in n and "jour" in n and "semaine" not in n:
+                return i
+    return default
 
 
 # ──────────────────────────────────────────────
@@ -247,6 +263,7 @@ def mark_command_done(sheet_row: int, reponse: str):
 
 def format_sheet_context(rows) -> str:
     lines = []
+    kmc = km_jour_col(rows)
     for row in rows[1:]:
         if not row or not row[0].strip():
             continue
@@ -254,7 +271,7 @@ def format_sheet_context(rows) -> str:
         jour   = row[1].strip() if len(row) > 1 else ""
         seance = row[2].strip() if len(row) > 2 else ""
         ress   = row[5].strip() if len(row) > 5 else ""
-        km     = row[7].strip() if len(row) > 7 else ""
+        km     = row[kmc].strip() if len(row) > kmc else ""
         lines.append(
             f"{date_s} | {jour} | Séance: {seance or '—'} | "
             f"Ressentis: {ress or '—'} | Km: {km or '—'}"

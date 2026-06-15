@@ -33,11 +33,14 @@ SA_JSON            = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 
 PARIS = ZoneInfo("Europe/Paris")
 
-COL_DATE      = 0
-COL_JOUR      = 1
-COL_SEANCE    = 2
-COL_RESSENTIS = 5
-COL_KM_JOUR   = 7
+# Disposition « Données Loys » : A=date B=jour C=séance … F=ressentis
+# G="Notes Nico" (colonne du COACH — NE JAMAIS écrire) H=km_journee I=km_semaine
+COL_DATE       = 0   # A
+COL_JOUR       = 1   # B
+COL_SEANCE     = 2   # C
+COL_RESSENTIS  = 5   # F
+COL_NOTES_NICO = 6   # G — coach, lecture seule
+COL_KM_JOUR    = 7   # H — fallback ; la vraie colonne est résolue par km_jour_col()
 
 JOURS_FR = {
     "Monday":"Lundi","Tuesday":"Mardi","Wednesday":"Mercredi",
@@ -60,7 +63,7 @@ def sheets_svc():
 
 def get_rows():
     r = sheets_svc().spreadsheets().values().get(
-        spreadsheetId=SPREADSHEET_ID, range=f"'{SHEET_NAME}'!A:J").execute()
+        spreadsheetId=SPREADSHEET_ID, range=f"'{SHEET_NAME}'!A:K").execute()
     return r.get("values", [])
 
 def find_row(rows, d):
@@ -73,6 +76,18 @@ def write_cell(row, col, val):
         spreadsheetId=SPREADSHEET_ID,
         range=f"'{SHEET_NAME}'!{chr(65+col)}{row+1}",
         valueInputOption="RAW", body={"values": [[val]]}).execute()
+
+def km_jour_col(rows, default: int = COL_KM_JOUR) -> int:
+    """Index 0-based de la colonne « km_journee », résolu via l'en-tête (ligne 0).
+    On cible la colonne par son NOM plutôt que par un index figé : l'ajout de
+    « Notes Nico » en G a décalé les colonnes, et un index codé en dur recasse à
+    chaque insertion. Ne matche jamais « km_semaine ». Fallback : COL_KM_JOUR (H)."""
+    if rows and rows[0]:
+        for i, raw in enumerate(rows[0]):
+            n = (raw or "").strip().lower()
+            if "km" in n and "jour" in n and "semaine" not in n:
+                return i
+    return default
 
 def parse_date(text):
     text = text.strip().lower(); y = date.today().year
@@ -88,19 +103,21 @@ def parse_date(text):
 
 def format_sheet_context(rows) -> str:
     lines = []
+    kmc = km_jour_col(rows)
     for row in rows[1:]:
         if not row or not row[0].strip(): continue
         date_s = row[0].strip() if len(row) > 0 else ""
         jour   = row[1].strip() if len(row) > 1 else ""
         seance = row[2].strip() if len(row) > 2 else ""
         ress   = row[5].strip() if len(row) > 5 else ""
-        km     = row[7].strip() if len(row) > 7 else ""
+        km     = row[kmc].strip() if len(row) > kmc else ""
         lines.append(f"{date_s} | {jour} | Séance: {seance or '—'} | Ressentis: {ress or '—'} | Km: {km or '—'}")
     return "\n".join(lines[-60:])
 
 # ── GRAPHIQUE STRAVA-LIKE ─────────────────────────────────────────────────────
 def get_weekly_data():
     rows  = get_rows()
+    kmc   = km_jour_col(rows)
     today = date.today()
     week_start = today - datetime.timedelta(days=today.weekday())
     week_end   = week_start + datetime.timedelta(days=6)
@@ -110,8 +127,8 @@ def get_weekly_data():
         try: d = date.fromisoformat(row[0].strip())
         except: continue
         km_val = 0.0
-        if len(row) > COL_KM_JOUR and row[COL_KM_JOUR].strip():
-            try: km_val = float(row[COL_KM_JOUR].strip().replace(",","."))
+        if len(row) > kmc and row[kmc].strip():
+            try: km_val = float(row[kmc].strip().replace(",","."))
             except: pass
         seance = row[COL_SEANCE].strip() if len(row) > COL_SEANCE else ""
         iso_week = d.isocalendar()[:2]
@@ -171,14 +188,15 @@ class RessentisModal(ui.Modal, title="🏃 Ta séance du jour"):
     km = ui.TextInput(label="Kilomètres réalisés",
         placeholder="Ex: 5.2", min_length=1, max_length=10)
 
-    def __init__(self, row_index):
+    def __init__(self, row_index, km_col=COL_KM_JOUR):
         super().__init__()
         self.row_index = row_index
+        self.km_col    = km_col   # colonne km_journee résolue par en-tête
 
     async def on_submit(self, interaction: discord.Interaction):
         r = str(self.ressentis); k = str(self.km).replace(",", ".")
         await asyncio.to_thread(write_cell, self.row_index, COL_RESSENTIS, r)
-        await asyncio.to_thread(write_cell, self.row_index, COL_KM_JOUR, k)
+        await asyncio.to_thread(write_cell, self.row_index, self.km_col, k)
         await interaction.response.edit_message(
             content=(f"<@{DISCORD_USER_ID}> Super, c'est noté ! 🎉\n"
                      f"**Ressentis :** {r}\n**Km :** {k} km\nBravo pour la séance ! 🏃‍♂️🔥"),
@@ -202,7 +220,7 @@ class SeanceView(ui.View):
         if row_idx is None:
             await interaction.response.send_message("❌ Aucune séance trouvée pour aujourd'hui.", ephemeral=True)
             return
-        await interaction.response.send_modal(RessentisModal(row_idx))
+        await interaction.response.send_modal(RessentisModal(row_idx, km_jour_col(rows)))
 
     @ui.button(label="❌ Non réalisée", style=discord.ButtonStyle.danger, custom_id="btn_non_realise")
     async def non_realise(self, interaction: discord.Interaction, button: ui.Button):
@@ -436,7 +454,8 @@ async def evening_check_task():
         return
 
     # Déjà répondu → rien faire
-    km_val    = row[COL_KM_JOUR].strip()   if len(row) > COL_KM_JOUR   else ""
+    kmc       = km_jour_col(rows)
+    km_val    = row[kmc].strip()           if len(row) > kmc           else ""
     ressentis = row[COL_RESSENTIS].strip() if len(row) > COL_RESSENTIS else ""
     if km_val or ressentis or "Non réalisée" in seance_txt:
         return
