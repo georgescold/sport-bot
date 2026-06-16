@@ -89,6 +89,16 @@ def km_jour_col(rows, default: int = COL_KM_JOUR) -> int:
                 return i
     return default
 
+def notes_nico_col(rows, default: int = COL_NOTES_NICO) -> int:
+    """Index 0-based de la colonne « Notes Nico » (coach), résolu via l'en-tête.
+    Robuste aux décalages de colonnes. Fallback : COL_NOTES_NICO (G)."""
+    if rows and rows[0]:
+        for i, raw in enumerate(rows[0]):
+            n = (raw or "").strip().lower()
+            if "notes" in n and "nico" in n:
+                return i
+    return default
+
 def parse_date(text):
     text = text.strip().lower(); y = date.today().year
     m = re.match(r"(\d{4})-(\d{2})-(\d{2})", text)
@@ -321,6 +331,7 @@ async def on_ready():
     # on_ready peut être rappelé à chaque reconnexion Gateway → tout doit être idempotent
     if not weekly_summary_task.is_running(): weekly_summary_task.start()
     if not evening_check_task.is_running():  evening_check_task.start()
+    if not coach_notes_task.is_running():    coach_notes_task.start()
     bot.add_view(SeanceView())
     bot.add_view(StartCoursesView())
     # Les slash commands ont été retirées (tout passe par !seance / !programme /
@@ -518,6 +529,116 @@ async def weekly_summary_task():
 
 @weekly_summary_task.before_loop
 async def before_weekly():
+    await bot.wait_until_ready()
+
+
+# ── TÂCHE 3 : NOTES DU COACH (Notes Nico) ────────────────────────────────────
+# Prévient Loys à chaque NOUVELLE note du coach, une seule fois par ajout.
+# L'état des notes déjà signalées vit dans un onglet CACHÉ (survit aux redémarrages).
+# 1er passage = baseline silencieux : on mémorise l'existant sans notifier.
+NOTES_STATE_SHEET = "Suivi Notes Coach"
+
+def _notes_state_write(svc, snapshot: dict):
+    """Réécrit l'onglet état (en-tête + {date: note})."""
+    svc.spreadsheets().values().clear(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"'{NOTES_STATE_SHEET}'!A:B").execute()
+    values = [["Date", "Note connue"]] + [[d, n] for d, n in snapshot.items()]
+    svc.spreadsheets().values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"'{NOTES_STATE_SHEET}'!A1",
+        valueInputOption="RAW",
+        body={"values": values}).execute()
+
+def _coach_notes_step(current: dict):
+    """Crée l'onglet état si besoin et renvoie (svc, initialise, stored{date:note}).
+    initialise=False uniquement au tout 1er passage (baseline écrit en silence).
+    Signal robuste : un onglet VIDE = pas encore initialisé (gère un crash éventuel
+    entre création et baseline → on re-baseline sans spammer)."""
+    svc  = sheets_svc()
+    meta = svc.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
+    titles = [s["properties"]["title"] for s in meta.get("sheets", [])]
+    if NOTES_STATE_SHEET not in titles:
+        svc.spreadsheets().batchUpdate(
+            spreadsheetId=SPREADSHEET_ID,
+            body={"requests": [{"addSheet": {"properties": {
+                "title": NOTES_STATE_SHEET, "hidden": True}}}]}).execute()
+    res = svc.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"'{NOTES_STATE_SHEET}'!A:B").execute()
+    rows = res.get("values", [])
+    if not rows:                       # onglet vide → baseline silencieux
+        _notes_state_write(svc, current)
+        return svc, False, dict(current)
+    stored = {}
+    for r in rows[1:]:
+        if r and r[0].strip():
+            stored[r[0].strip()] = r[1].strip() if len(r) > 1 else ""
+    return svc, True, stored
+
+async def _send_chunked(channel, header, lines, limit=1900):
+    """Envoie header + lines en plusieurs messages si on dépasse la limite Discord."""
+    msg = header
+    for ln in lines:
+        if len(msg) + 1 + len(ln) > limit:
+            await channel.send(msg); msg = ln
+        else:
+            msg = f"{msg}\n{ln}"
+    await channel.send(msg)
+
+@tasks.loop(minutes=30)
+async def coach_notes_task():
+    """Toutes les 30 min : signale les nouvelles notes du coach (1 fois par ajout)."""
+    channel = bot.get_channel(DISCORD_CHANNEL_ID)
+    if not channel: return
+    try:
+        rows = await asyncio.to_thread(get_rows)
+    except Exception as e:
+        print(f"⚠️ Notes coach (lecture sheet) : {e}"); return
+    nc = notes_nico_col(rows)
+    current = {}
+    for row in rows[1:]:
+        if not row or not row[0].strip(): continue
+        note = row[nc].strip() if len(row) > nc else ""
+        if note:
+            current[row[0].strip()] = note
+    try:
+        svc, initialise, stored = await asyncio.to_thread(_coach_notes_step, current)
+    except Exception as e:
+        print(f"⚠️ Notes coach (état) : {e}"); return
+
+    if not initialise:   # 1er passage : message d'activation unique, pas de spam
+        await channel.send(
+            "👀 Surveillance des notes du coach (**Nico**) activée — "
+            "je te préviens dès qu'une note est ajoutée. 📝")
+        return
+
+    new_items = sorted((d, n) for d, n in current.items() if stored.get(d) != n)
+    if not new_items:
+        if current != stored:   # note retirée par le coach → resync silencieux
+            await asyncio.to_thread(_notes_state_write, svc, current)
+        return
+
+    lines = []
+    for d, note in new_items:
+        try:
+            dd = date.fromisoformat(d)
+            label = f"{JOURS_FR[dd.strftime('%A')]} {dd.strftime('%d/%m')}"
+        except Exception:
+            label = d
+        note_disp = note if len(note) <= 400 else note[:399] + "…"
+        lines.append(f"• **{label}** : {note_disp}")
+    try:
+        await _send_chunked(
+            channel, f"📝 <@{DISCORD_USER_ID}> **Nouvelle(s) note(s) du coach Nico !**", lines)
+    except Exception as e:
+        # envoi échoué → on NE sauvegarde PAS l'état : re-tenté au prochain passage
+        print(f"⚠️ Notes coach (envoi) : {e}"); return
+    # envoi OK → on mémorise pour ne plus re-signaler ces notes
+    await asyncio.to_thread(_notes_state_write, svc, current)
+
+@coach_notes_task.before_loop
+async def before_coach_notes():
     await bot.wait_until_ready()
 
 
