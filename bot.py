@@ -1,12 +1,14 @@
 """
 bot.py — Bot Discord "Road to sub 38"
   !seance                  → séance du jour avec boutons (instantané, cache du jour)
+  !seance semaine          → récap de toutes les séances de la semaine (lun→dim)
   !programme <date> : <s>  → modifie le planning
   !claude <demande>        → modification IA du sheet (langage naturel)
   Bouton ✅                → modale ressentis + km
   Bouton ❌                → séance non réalisée
   21h05 quotidien          → rappel si séance non renseignée (ou msg neutre si vide)
   21h00 dimanche           → résumé hebdomadaire + graphique Strava-like
+  toutes les 30 min        → notif si nouvelle note du coach (colonne Notes Nico)
 """
 
 import os, re, json, asyncio, io, datetime
@@ -322,6 +324,34 @@ async def send_seance_msg(channel):
         await channel.send(content=content)
 
 
+async def build_semaine_response() -> str:
+    """Récap texte de toutes les séances de la semaine en cours (lundi → dimanche)."""
+    rows  = await asyncio.to_thread(get_rows)
+    kmc   = km_jour_col(rows)
+    today = date.today()
+    week_start = today - datetime.timedelta(days=today.weekday())   # lundi
+    week_end   = week_start + datetime.timedelta(days=6)
+    by_date = {row[0].strip(): row for row in rows[1:] if row and row[0].strip()}
+    lines = []
+    for i in range(7):
+        d       = week_start + datetime.timedelta(days=i)
+        row     = by_date.get(d.isoformat())
+        jour_fr = JOURS_FR[d.strftime("%A")]
+        seance  = row[COL_SEANCE].strip() if row and len(row) > COL_SEANCE else ""
+        km      = row[kmc].strip()        if row and len(row) > kmc        else ""
+        if not seance:
+            body = "_rien de programmé_"
+        elif "repos" in seance.lower():
+            body = f"{seance} 😴"
+        else:
+            body = f"{seance} — ✅ {km} km" if km else seance
+        marker = "👉 " if d == today else ""
+        lines.append(f"{marker}**{jour_fr} {d.strftime('%d/%m')}** — {body}")
+    header = (f"📅 **Tes séances — semaine du {week_start.strftime('%d/%m')} "
+              f"au {week_end.strftime('%d/%m')}**")
+    return header + "\n\n" + "\n".join(lines)
+
+
 _tree_synced = False
 
 @bot.event
@@ -361,12 +391,15 @@ async def on_ready():
 
 
 @bot.command(name="seance")
-async def cmd_seance(ctx):
-    """!seance → envoie la séance du jour avec boutons."""
+async def cmd_seance(ctx, *, arg: str = ""):
+    """!seance → séance du jour (boutons) · !seance semaine → récap de la semaine."""
     if ctx.channel.id != DISCORD_CHANNEL_ID: return
     try: await ctx.message.delete()
     except: pass
-    await send_seance_msg(ctx.channel)
+    if arg.strip().lower().startswith(("semaine", "sem", "week")):
+        await ctx.channel.send(await build_semaine_response())
+    else:
+        await send_seance_msg(ctx.channel)
 
 
 async def apply_programme(date_raw: str, seance: str) -> str:
