@@ -36,6 +36,7 @@ SERVICE_ACCOUNT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 COL_DATE       = 0   # A
 COL_JOUR       = 1   # B
 COL_SEANCE     = 2   # C
+COL_TYPE       = 4   # E — type de séance (déduit de C si vide ; coach prioritaire)
 COL_RESSENTIS  = 5   # F
 COL_NOTES_NICO = 6   # G — coach, lecture seule
 COL_KM_JOUR    = 7   # H — fallback ; la vraie colonne est résolue par km_jour_col()
@@ -90,6 +91,44 @@ JOUR_TO_WD = {"lundi":0,"mardi":1,"mercredi":2,"jeudi":3,
 def _row_set(row, col, val):
     while len(row) <= col: row.append("")
     row[col] = val
+
+def seance_type(seance: str) -> str:
+    """Déduit le « Type séance » (col E) depuis le libellé de la séance (col C).
+    Vocabulaire aligné sur le coach (Footing / Repos) + types évidents."""
+    t = (seance or "").strip().lower()
+    if not t:
+        return ""
+    if t.startswith("repos"):
+        return "Repos"
+    if "renfo" in t or "muscu" in t:
+        return "Renfo"
+    if "mobilit" in t:
+        return "Mobilité"
+    return "Footing"   # toute séance de course (footing, gammes, fractionné, côtes…)
+
+def backfill_types(rows, service=None) -> int:
+    """Remplit la colonne E (Type séance) VIDE à partir de la séance (col C).
+    Ne touche JAMAIS une cellule E déjà remplie (le coach reste prioritaire).
+    Modifie `rows` en place ; renvoie le nombre de cellules complétées."""
+    filled = 0
+    for i, row in enumerate(rows):
+        if i == 0 or not row:
+            continue
+        seance = row[COL_SEANCE].strip() if len(row) > COL_SEANCE else ""
+        if not seance:
+            continue
+        cur = row[COL_TYPE].strip() if len(row) > COL_TYPE else ""
+        if cur:
+            continue
+        typ = seance_type(seance)
+        if not typ:
+            continue
+        _row_set(row, COL_TYPE, typ)
+        filled += 1
+        if service is not None:
+            try: update_cell(service, i, COL_TYPE, typ)
+            except Exception as e: print(f"⚠️ backfill type ligne {i+1} : {e}")
+    return filled
 
 def backfill_dates(rows, service=None) -> int:
     """Complète les dates (col A) ET les jours (col B) manquants, et les écrit
@@ -249,9 +288,11 @@ def run_reminder():
     print(f"🏃 MODE REMINDER — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
     rows = get_all_rows()
-    n = backfill_dates(rows, service=get_sheets_service())   # complète col A manquante
-    if n:
-        print(f"  🔧 {n} date(s) complétée(s) en colonne A")
+    svc_bf = get_sheets_service()
+    n  = backfill_dates(rows, service=svc_bf)   # complète col A/B manquantes
+    nt = backfill_types(rows, service=svc_bf)   # remplit col E (type) si vide
+    if n or nt:
+        print(f"  🔧 {n} date(s)/jour(s) + {nt} type(s) complété(s)")
     today_str = date.today().isoformat()
     today_day = JOURS_FR[date.today().strftime("%A")]
     row_idx   = find_row_for_date(rows, today_str)

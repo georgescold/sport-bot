@@ -40,6 +40,7 @@ PARIS = ZoneInfo("Europe/Paris")
 COL_DATE       = 0   # A
 COL_JOUR       = 1   # B
 COL_SEANCE     = 2   # C
+COL_TYPE       = 4   # E — type de séance (déduit de C si vide ; coach prioritaire)
 COL_RESSENTIS  = 5   # F
 COL_NOTES_NICO = 6   # G — coach, lecture seule
 COL_KM_JOUR    = 7   # H — fallback ; la vraie colonne est résolue par km_jour_col()
@@ -80,6 +81,44 @@ JOUR_TO_WD = {"lundi":0,"mardi":1,"mercredi":2,"jeudi":3,
 def _row_set(row, col, val):
     while len(row) <= col: row.append("")
     row[col] = val
+
+def seance_type(seance: str) -> str:
+    """Déduit le « Type séance » (col E) depuis le libellé de la séance (col C).
+    Vocabulaire aligné sur le coach (Footing / Repos) + types évidents."""
+    t = (seance or "").strip().lower()
+    if not t:
+        return ""
+    if t.startswith("repos"):
+        return "Repos"
+    if "renfo" in t or "muscu" in t:
+        return "Renfo"
+    if "mobilit" in t:
+        return "Mobilité"
+    return "Footing"   # toute séance de course (footing, gammes, fractionné, côtes…)
+
+def backfill_types(rows, persist: bool = True) -> int:
+    """Remplit la colonne E (Type séance) VIDE à partir de la séance (col C).
+    Ne touche JAMAIS une cellule E déjà remplie (le coach reste prioritaire).
+    Modifie `rows` en place ; renvoie le nombre de cellules complétées."""
+    filled = 0
+    for i, row in enumerate(rows):
+        if i == 0 or not row:
+            continue
+        seance = row[COL_SEANCE].strip() if len(row) > COL_SEANCE else ""
+        if not seance:
+            continue
+        cur = row[COL_TYPE].strip() if len(row) > COL_TYPE else ""
+        if cur:                        # déjà rempli (coach) → on respecte
+            continue
+        typ = seance_type(seance)
+        if not typ:
+            continue
+        _row_set(row, COL_TYPE, typ)
+        filled += 1
+        if persist:
+            try: write_cell(i, COL_TYPE, typ)
+            except Exception as e: print(f"⚠️ backfill type ligne {i+1} : {e}")
+    return filled
 
 def backfill_dates(rows, persist: bool = True) -> int:
     """Complète les dates (col A) ET les jours (col B) manquants, et les écrit
@@ -357,6 +396,7 @@ async def get_today_seance() -> dict:
         return _seance_cache
     rows    = await asyncio.to_thread(get_rows)
     await asyncio.to_thread(backfill_dates, rows)   # complète les dates col A manquantes
+    await asyncio.to_thread(backfill_types, rows)   # remplit la col E (type) si vide
     row_idx = find_row(rows, today_str)
     info = {"date": today_str, "row_idx": row_idx, "seance": "", "jour": ""}
     if row_idx is not None:
@@ -569,6 +609,7 @@ async def evening_check_task():
 
     rows    = await asyncio.to_thread(get_rows)
     await asyncio.to_thread(backfill_dates, rows)   # complète les dates col A manquantes
+    await asyncio.to_thread(backfill_types, rows)   # remplit la col E (type) si vide
     row_idx = find_row(rows, today_str)
 
     # Pas de ligne pour aujourd'hui
@@ -646,6 +687,7 @@ async def coach_notes_task():
     try:
         rows = await asyncio.to_thread(get_rows)
         await asyncio.to_thread(backfill_dates, rows)   # garantit la ligne du jour
+        await asyncio.to_thread(backfill_types, rows)   # remplit la col E (type) si vide
     except Exception as e:
         print(f"⚠️ Note coach (lecture sheet) : {e}"); return
 
