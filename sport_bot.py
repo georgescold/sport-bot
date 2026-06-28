@@ -14,7 +14,7 @@ import argparse
 import os
 import re
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import requests
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -82,6 +82,72 @@ def find_row_for_date(rows, target_date: str) -> int | None:
         if row and row[COL_DATE].strip() == target_date:
             return i
     return None
+
+
+JOUR_TO_WD = {"lundi":0,"mardi":1,"mercredi":2,"jeudi":3,
+              "vendredi":4,"samedi":5,"dimanche":6}
+
+def _row_set(row, col, val):
+    while len(row) <= col: row.append("")
+    row[col] = val
+
+def backfill_dates(rows, service=None) -> int:
+    """Complète les dates (col A) ET les jours (col B) manquants, et les écrit
+    dans le Sheet.
+
+    Le coach remplit parfois la séance (col C) du planning à venir mais laisse la
+    date (A) et/ou le jour (B) vides ; sans date, find_row_for_date() ne retrouve
+    plus la ligne du jour. Reconstruction :
+      • jour manquant mais date présente   → jour déduit de la date ;
+      • date manquante mais jour présent   → 1ʳᵉ date après la dernière connue
+                                             dont le weekday == col B ;
+      • date ET jour manquants (séance présente) → jour consécutif suivant.
+    Lignes entièrement vides ignorées. Modifie `rows` en place ; renvoie le nb de
+    lignes touchées."""
+    last_date = None
+    filled = 0
+    for i, row in enumerate(rows):
+        if i == 0 or not row:
+            continue
+        a = row[COL_DATE].strip()   if len(row) > COL_DATE   else ""
+        b = row[COL_JOUR].strip()   if len(row) > COL_JOUR   else ""
+        c = row[COL_SEANCE].strip() if len(row) > COL_SEANCE else ""
+        if a:
+            try: last_date = date.fromisoformat(a)
+            except ValueError: continue
+            if not b:
+                jr = JOURS_FR[last_date.strftime("%A")]
+                _row_set(row, COL_JOUR, jr); filled += 1
+                if service is not None:
+                    try: update_cell(service, i, COL_JOUR, jr)
+                    except Exception as e: print(f"⚠️ backfill jour ligne {i+1} : {e}")
+            continue
+        if last_date is None or (not b and not c):
+            continue
+        wd = JOUR_TO_WD.get(b.lower()) if b else None
+        cand = last_date
+        if wd is not None:
+            for _ in range(7):
+                cand += timedelta(days=1)
+                if cand.weekday() == wd:
+                    break
+            else:
+                continue
+        else:
+            cand += timedelta(days=1)
+        _row_set(row, COL_DATE, cand.isoformat())
+        if service is not None:
+            try: update_cell(service, i, COL_DATE, cand.isoformat())
+            except Exception as e: print(f"⚠️ backfill date ligne {i+1} : {e}")
+        if not b:
+            jr = JOURS_FR[cand.strftime("%A")]
+            _row_set(row, COL_JOUR, jr)
+            if service is not None:
+                try: update_cell(service, i, COL_JOUR, jr)
+                except Exception as e: print(f"⚠️ backfill jour ligne {i+1} : {e}")
+        last_date = cand
+        filled   += 1
+    return filled
 
 
 def update_cell(service, row_index: int, col_index: int, value: str):
@@ -183,6 +249,9 @@ def run_reminder():
     print(f"🏃 MODE REMINDER — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
     rows = get_all_rows()
+    n = backfill_dates(rows, service=get_sheets_service())   # complète col A manquante
+    if n:
+        print(f"  🔧 {n} date(s) complétée(s) en colonne A")
     today_str = date.today().isoformat()
     today_day = JOURS_FR[date.today().strftime("%A")]
     row_idx   = find_row_for_date(rows, today_str)

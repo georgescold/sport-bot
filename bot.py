@@ -8,7 +8,7 @@ bot.py — Bot Discord "Road to sub 38"
   Bouton ❌                → séance non réalisée
   21h05 quotidien          → rappel si séance non renseignée (ou msg neutre si vide)
   21h00 dimanche           → résumé hebdomadaire + graphique Strava-like
-  toutes les 30 min        → notif si nouvelle note du coach (colonne Notes Nico)
+  6h00 quotidien           → note du coach du jour (colonne Notes Nico), 1 à la fois
 """
 
 import os, re, json, asyncio, io, datetime
@@ -72,6 +72,73 @@ def find_row(rows, d):
     for i, r in enumerate(rows):
         if r and r[0].strip() == d: return i
     return None
+
+# FR jour → numéro de weekday (0 = lundi) pour reconstruire les dates manquantes.
+JOUR_TO_WD = {"lundi":0,"mardi":1,"mercredi":2,"jeudi":3,
+              "vendredi":4,"samedi":5,"dimanche":6}
+
+def _row_set(row, col, val):
+    while len(row) <= col: row.append("")
+    row[col] = val
+
+def backfill_dates(rows, persist: bool = True) -> int:
+    """Complète les dates (col A) ET les jours (col B) manquants, et les écrit
+    dans le Sheet.
+
+    Le coach remplit parfois la séance (col C) du planning à venir mais laisse la
+    date (A) et/ou le jour (B) vides. Sans date, find_row() ne retrouve pas la
+    ligne du jour → « Aucune séance trouvée » et les boutons n'ont aucune ligne
+    où écrire (rien n'arrive dans le Drive). Reconstruction :
+      • jour manquant mais date présente   → jour déduit de la date ;
+      • date manquante mais jour présent   → 1ʳᵉ date après la dernière connue
+                                             dont le weekday == col B ;
+      • date ET jour manquants (séance présente) → jour consécutif suivant.
+    Les lignes entièrement vides (ni jour ni séance) sont ignorées (espaceurs /
+    bas de planning). Modifie `rows` en place ; renvoie le nb de lignes touchées."""
+    last_date = None
+    filled = 0
+    for i, row in enumerate(rows):
+        if i == 0 or not row:
+            continue
+        a = row[0].strip() if len(row) > 0 else ""
+        b = row[1].strip() if len(row) > 1 else ""
+        c = row[2].strip() if len(row) > 2 else ""
+        if a:                                   # ligne datée = ancre
+            try: last_date = date.fromisoformat(a)
+            except ValueError: continue
+            if not b:                           # jour manquant → déduit de la date
+                jr = JOURS_FR[last_date.strftime("%A")]
+                _row_set(row, COL_JOUR, jr); filled += 1
+                if persist:
+                    try: write_cell(i, COL_JOUR, jr)
+                    except Exception as e: print(f"⚠️ backfill jour ligne {i+1} : {e}")
+            continue
+        if last_date is None or (not b and not c):   # pas d'ancre / ligne vide
+            continue
+        wd = JOUR_TO_WD.get(b.lower()) if b else None
+        cand = last_date
+        if wd is not None:                      # jour connu → date du bon weekday
+            for _ in range(7):
+                cand += datetime.timedelta(days=1)
+                if cand.weekday() == wd:
+                    break
+            else:
+                continue
+        else:                                   # jour absent → jour suivant consécutif
+            cand += datetime.timedelta(days=1)
+        _row_set(row, COL_DATE, cand.isoformat())
+        if persist:
+            try: write_cell(i, COL_DATE, cand.isoformat())
+            except Exception as e: print(f"⚠️ backfill date ligne {i+1} : {e}")
+        if not b:                               # jour aussi manquant → déduit
+            jr = JOURS_FR[cand.strftime("%A")]
+            _row_set(row, COL_JOUR, jr)
+            if persist:
+                try: write_cell(i, COL_JOUR, jr)
+                except Exception as e: print(f"⚠️ backfill jour ligne {i+1} : {e}")
+        last_date = cand
+        filled   += 1
+    return filled
 
 def write_cell(row, col, val):
     sheets_svc().spreadsheets().values().update(
@@ -289,6 +356,7 @@ async def get_today_seance() -> dict:
     if _seance_cache.get("date") == today_str:
         return _seance_cache
     rows    = await asyncio.to_thread(get_rows)
+    await asyncio.to_thread(backfill_dates, rows)   # complète les dates col A manquantes
     row_idx = find_row(rows, today_str)
     info = {"date": today_str, "row_idx": row_idx, "seance": "", "jour": ""}
     if row_idx is not None:
@@ -500,6 +568,7 @@ async def evening_check_task():
     today_day = JOURS_FR[date.today().strftime("%A")]
 
     rows    = await asyncio.to_thread(get_rows)
+    await asyncio.to_thread(backfill_dates, rows)   # complète les dates col A manquantes
     row_idx = find_row(rows, today_str)
 
     # Pas de ligne pour aujourd'hui
@@ -565,110 +634,41 @@ async def before_weekly():
     await bot.wait_until_ready()
 
 
-# ── TÂCHE 3 : NOTES DU COACH (Notes Nico) ────────────────────────────────────
-# Prévient Loys à chaque NOUVELLE note du coach, une seule fois par ajout.
-# L'état des notes déjà signalées vit dans un onglet CACHÉ (survit aux redémarrages).
-# 1er passage = baseline silencieux : on mémorise l'existant sans notifier.
-NOTES_STATE_SHEET = "Suivi Notes Coach"
-
-def _notes_state_write(svc, snapshot: dict):
-    """Réécrit l'onglet état (en-tête + {date: note})."""
-    svc.spreadsheets().values().clear(
-        spreadsheetId=SPREADSHEET_ID,
-        range=f"'{NOTES_STATE_SHEET}'!A:B").execute()
-    values = [["Date", "Note connue"]] + [[d, n] for d, n in snapshot.items()]
-    svc.spreadsheets().values().update(
-        spreadsheetId=SPREADSHEET_ID,
-        range=f"'{NOTES_STATE_SHEET}'!A1",
-        valueInputOption="RAW",
-        body={"values": values}).execute()
-
-def _coach_notes_step(current: dict):
-    """Crée l'onglet état si besoin et renvoie (svc, initialise, stored{date:note}).
-    initialise=False uniquement au tout 1er passage (baseline écrit en silence).
-    Signal robuste : un onglet VIDE = pas encore initialisé (gère un crash éventuel
-    entre création et baseline → on re-baseline sans spammer)."""
-    svc  = sheets_svc()
-    meta = svc.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
-    titles = [s["properties"]["title"] for s in meta.get("sheets", [])]
-    if NOTES_STATE_SHEET not in titles:
-        svc.spreadsheets().batchUpdate(
-            spreadsheetId=SPREADSHEET_ID,
-            body={"requests": [{"addSheet": {"properties": {
-                "title": NOTES_STATE_SHEET, "hidden": True}}}]}).execute()
-    res = svc.spreadsheets().values().get(
-        spreadsheetId=SPREADSHEET_ID,
-        range=f"'{NOTES_STATE_SHEET}'!A:B").execute()
-    rows = res.get("values", [])
-    if not rows:                       # onglet vide → baseline silencieux
-        _notes_state_write(svc, current)
-        return svc, False, dict(current)
-    stored = {}
-    for r in rows[1:]:
-        if r and r[0].strip():
-            stored[r[0].strip()] = r[1].strip() if len(r) > 1 else ""
-    return svc, True, stored
-
-async def _send_chunked(channel, header, lines, limit=1900):
-    """Envoie header + lines en plusieurs messages si on dépasse la limite Discord."""
-    msg = header
-    for ln in lines:
-        if len(msg) + 1 + len(ln) > limit:
-            await channel.send(msg); msg = ln
-        else:
-            msg = f"{msg}\n{ln}"
-    await channel.send(msg)
-
-@tasks.loop(minutes=30)
+# ── TÂCHE 3 : NOTE DU COACH DU JOUR (Notes Nico) — 6h00 ──────────────────────
+# Livre la note du coach pour la séance DU JOUR, le matin même à 6h00, une seule
+# note à la fois. Ainsi Loys reçoit la consigne juste avant de s'entraîner et ne
+# se fait pas noyer par toutes les notes futures publiées d'un coup par le coach.
+@tasks.loop(time=datetime.time(hour=6, minute=0, tzinfo=PARIS))
 async def coach_notes_task():
-    """Toutes les 30 min : signale les nouvelles notes du coach (1 fois par ajout)."""
+    """6h00 chaque jour : envoie la note du coach pour la séance du jour (si elle existe)."""
     channel = bot.get_channel(DISCORD_CHANNEL_ID)
     if not channel: return
     try:
         rows = await asyncio.to_thread(get_rows)
+        await asyncio.to_thread(backfill_dates, rows)   # garantit la ligne du jour
     except Exception as e:
-        print(f"⚠️ Notes coach (lecture sheet) : {e}"); return
-    nc = notes_nico_col(rows)
-    current = {}
-    for row in rows[1:]:
-        if not row or not row[0].strip(): continue
-        note = row[nc].strip() if len(row) > nc else ""
-        if note:
-            current[row[0].strip()] = note
-    try:
-        svc, initialise, stored = await asyncio.to_thread(_coach_notes_step, current)
-    except Exception as e:
-        print(f"⚠️ Notes coach (état) : {e}"); return
+        print(f"⚠️ Note coach (lecture sheet) : {e}"); return
 
-    if not initialise:   # 1er passage : message d'activation unique, pas de spam
+    today_str = date.today().isoformat()
+    row_idx   = find_row(rows, today_str)
+    if row_idx is None:
+        return                                          # pas de ligne aujourd'hui → silence
+
+    row  = rows[row_idx]
+    nc   = notes_nico_col(rows)
+    note = row[nc].strip() if len(row) > nc else ""
+    if not note:
+        return                                          # pas de note ce jour → silence
+
+    jour    = row[COL_JOUR].strip() if len(row) > COL_JOUR else JOURS_FR[date.today().strftime("%A")]
+    date_fr = date.today().strftime("%d/%m/%Y")
+    note_disp = note if len(note) <= 1800 else note[:1799] + "…"
+    try:
         await channel.send(
-            "👀 Surveillance des notes du coach (**Nico**) activée — "
-            "je te préviens dès qu'une note est ajoutée. 📝")
-        return
-
-    new_items = sorted((d, n) for d, n in current.items() if stored.get(d) != n)
-    if not new_items:
-        if current != stored:   # note retirée par le coach → resync silencieux
-            await asyncio.to_thread(_notes_state_write, svc, current)
-        return
-
-    lines = []
-    for d, note in new_items:
-        try:
-            dd = date.fromisoformat(d)
-            label = f"{JOURS_FR[dd.strftime('%A')]} {dd.strftime('%d/%m')}"
-        except Exception:
-            label = d
-        note_disp = note if len(note) <= 400 else note[:399] + "…"
-        lines.append(f"• **{label}** : {note_disp}")
-    try:
-        await _send_chunked(
-            channel, f"📝 <@{DISCORD_USER_ID}> **Nouvelle(s) note(s) du coach Nico !**", lines)
+            f"📝 <@{DISCORD_USER_ID}> **Note du coach Nico — {jour} {date_fr}**\n"
+            f"> {note_disp}")
     except Exception as e:
-        # envoi échoué → on NE sauvegarde PAS l'état : re-tenté au prochain passage
-        print(f"⚠️ Notes coach (envoi) : {e}"); return
-    # envoi OK → on mémorise pour ne plus re-signaler ces notes
-    await asyncio.to_thread(_notes_state_write, svc, current)
+        print(f"⚠️ Note coach (envoi) : {e}")
 
 @coach_notes_task.before_loop
 async def before_coach_notes():
