@@ -5,3 +5,5 @@
 __pycache__/
 *.pyc
 .env.local
+.venv/
+run_local.py

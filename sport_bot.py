@@ -1,7 +1,10 @@
 """
 sport_bot.py — Outils de la routine cloud
 -----------------------------------------
-MODE --reminder      → envoie le rappel de séance Discord (routine, fenêtre 17h-18h)
+MODE --reminder      → envoie le rappel de séance Discord (DÉPRÉCIÉ : le rappel est
+                       désormais planifié à 8h00 par bot.py, tâche morning_reminder_task.
+                       Ne plus appeler depuis la routine cloud → sinon double envoi.
+                       Conservé pour un envoi manuel ponctuel.)
 MODE --scrape-races  → scrape jogging-plus et alimente l'onglet « Courses »
 
 Les helpers de l'onglet « Commandes » (ensure_commands_sheet, get_pending_commands,

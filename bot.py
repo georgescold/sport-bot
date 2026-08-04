@@ -470,6 +470,7 @@ async def on_ready():
     if not weekly_summary_task.is_running(): weekly_summary_task.start()
     if not evening_check_task.is_running():  evening_check_task.start()
     if not coach_notes_task.is_running():    coach_notes_task.start()
+    if not morning_reminder_task.is_running(): morning_reminder_task.start()
     bot.add_view(SeanceView())
     bot.add_view(StartCoursesView())
     # Les slash commands ont été retirées (tout passe par !seance / !programme /
@@ -544,6 +545,8 @@ COMMANDS_SHEET = "Commandes"
 
 # Heures de passage (Paris) de la routine cloud qui traite l'onglet Commandes.
 # À garder synchro avec le cron de la routine claude.ai : 45 7,12,17,18,21 * * *
+# (Ces passages ne servent plus qu'à l'onglet Commandes : le rappel de séance est
+#  désormais envoyé par morning_reminder_task à 8h00, cf. plus bas.)
 ROUTINE_RUN_TIMES = (
     datetime.time(7, 45), datetime.time(12, 45), datetime.time(17, 45),
     datetime.time(18, 45), datetime.time(21, 45),
@@ -716,6 +719,48 @@ async def coach_notes_task():
 async def before_coach_notes():
     await bot.wait_until_ready()
 
+
+# ── TÂCHE 4 : RAPPEL DE SÉANCE DU MATIN — 8h00 ───────────────────────────────
+# Anciennement envoyé par la routine cloud claude.ai (`sport_bot.py --reminder`,
+# fenêtre 17h-18h). Rapatrié ici : le bot Railway tourne déjà 24/7, c'est plus
+# fiable et la planification est versionnée avec le code.
+# ⚠️ L'étape --reminder doit rester désactivée côté routine, sinon double envoi.
+@tasks.loop(time=datetime.time(hour=8, minute=0, tzinfo=PARIS))
+async def morning_reminder_task():
+    """8h00 chaque jour : annonce la séance du jour avec les boutons de validation."""
+    channel = bot.get_channel(DISCORD_CHANNEL_ID)
+    if not channel: return
+    try:
+        rows = await asyncio.to_thread(get_rows)
+        await asyncio.to_thread(backfill_dates, rows)   # complète les dates col A/B manquantes
+        await asyncio.to_thread(backfill_types, rows)   # remplit la col E (type) si vide
+    except Exception as e:
+        print(f"⚠️ Rappel matin (lecture sheet) : {e}"); return
+
+    today_str = date.today().isoformat()
+    row_idx   = find_row(rows, today_str)
+    if row_idx is None:
+        print(f"⚠️ Rappel matin : aucune ligne pour {today_str}"); return
+
+    row     = rows[row_idx]
+    seance  = row[COL_SEANCE].strip() if len(row) > COL_SEANCE else "Repos"
+    jour    = row[COL_JOUR].strip()   if len(row) > COL_JOUR   else JOURS_FR[date.today().strftime("%A")]
+    date_fr = date.today().strftime("%d/%m/%Y")
+
+    try:
+        await channel.send(
+            content=(f"🏃 Hey <@{DISCORD_USER_ID}> ! N'oublie pas de t'entraîner ! 💪\n\n"
+                     f"**📅 Séance — {jour} {date_fr}**\n"
+                     f"> **{seance}**\n\n"
+                     f"Clique sur un bouton une fois ta séance terminée 👇"),
+            view=SeanceView())
+    except Exception as e:
+        print(f"⚠️ Rappel matin (envoi) : {e}")
+
+
+@morning_reminder_task.before_loop
+async def before_morning_reminder():
+    await bot.wait_until_ready()
 
 
 # ── COURSES ───────────────────────────────────────────────────────────────────
