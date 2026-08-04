@@ -179,7 +179,7 @@ def backfill_dates(rows, service=None) -> int:
             cand += timedelta(days=1)
         _row_set(row, COL_DATE, cand.isoformat())
         if service is not None:
-            try: update_cell(service, i, COL_DATE, cand.isoformat())
+            try: update_cell(service, i, COL_DATE, cand.isoformat(), parse=True)
             except Exception as e: print(f"⚠️ backfill date ligne {i+1} : {e}")
         if not b:
             jr = JOURS_FR[cand.strftime("%A")]
@@ -192,7 +192,12 @@ def backfill_dates(rows, service=None) -> int:
     return filled
 
 
-def update_cell(service, row_index: int, col_index: int, value: str):
+def update_cell(service, row_index: int, col_index: int, value: str, parse: bool = False):
+    """parse=True → USER_ENTERED : Sheets interprète la valeur (nombre, date) au
+    lieu de la stocker en texte. Requis pour la date (col A) et les km, dont
+    dépendent les formules d'agrégat I..L : SUMIFS ignore le texte.
+    parse=False pour le texte libre (une valeur commençant par « = » serait
+    sinon interprétée comme une formule)."""
     col_letter = chr(ord("A") + col_index)
     sheet_row  = row_index + 1
     cell_range = f"'{SHEET_NAME}'!{col_letter}{sheet_row}"
@@ -200,7 +205,7 @@ def update_cell(service, row_index: int, col_index: int, value: str):
     service.spreadsheets().values().update(
         spreadsheetId=SPREADSHEET_ID,
         range=cell_range,
-        valueInputOption="RAW",
+        valueInputOption="USER_ENTERED" if parse else "RAW",
         body=body
     ).execute()
     print(f"  ✅ Sheet : {cell_range} = '{value}'")

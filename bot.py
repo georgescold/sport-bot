@@ -167,7 +167,7 @@ def backfill_dates(rows, persist: bool = True) -> int:
             cand += datetime.timedelta(days=1)
         _row_set(row, COL_DATE, cand.isoformat())
         if persist:
-            try: write_cell(i, COL_DATE, cand.isoformat())
+            try: write_cell(i, COL_DATE, cand.isoformat(), parse=True)
             except Exception as e: print(f"⚠️ backfill date ligne {i+1} : {e}")
         if not b:                               # jour aussi manquant → déduit
             jr = JOURS_FR[cand.strftime("%A")]
@@ -179,11 +179,20 @@ def backfill_dates(rows, persist: bool = True) -> int:
         filled   += 1
     return filled
 
-def write_cell(row, col, val):
+def write_cell(row, col, val, parse: bool = False):
+    """Écrit une cellule. parse=True → USER_ENTERED : Sheets interprète la valeur
+    (nombre, date) au lieu de la stocker en texte.
+
+    Indispensable pour la date (col A) et les km : en RAW, "4.22" est stocké comme
+    TEXTE, or SUMIFS/SUM ignorent le texte → les colonnes d'agrégat I..L
+    (Km_semaine / 7j / mois / annuel) sous-compteraient silencieusement.
+    Laisser parse=False pour tout texte libre : un ressenti ou une séance
+    commençant par « = » serait sinon interprété comme une formule."""
     sheets_svc().spreadsheets().values().update(
         spreadsheetId=SPREADSHEET_ID,
         range=f"'{SHEET_NAME}'!{chr(65+col)}{row+1}",
-        valueInputOption="RAW", body={"values": [[val]]}).execute()
+        valueInputOption="USER_ENTERED" if parse else "RAW",
+        body={"values": [[val]]}).execute()
 
 def km_jour_col(rows, default: int = COL_KM_JOUR) -> int:
     """Index 0-based de la colonne « km_journee », résolu via l'en-tête (ligne 0).
@@ -332,7 +341,7 @@ class RessentisModal(ui.Modal, title="🏃 Ta séance du jour"):
     async def on_submit(self, interaction: discord.Interaction):
         r = str(self.ressentis); k = str(self.km).replace(",", ".")
         await asyncio.to_thread(write_cell, self.row_index, COL_RESSENTIS, r)
-        await asyncio.to_thread(write_cell, self.row_index, self.km_col, k)
+        await asyncio.to_thread(write_cell, self.row_index, self.km_col, k, True)
         await interaction.response.edit_message(
             content=(f"<@{DISCORD_USER_ID}> Super, c'est noté ! 🎉\n"
                      f"**Ressentis :** {r}\n**Km :** {k} km\nBravo pour la séance ! 🏃‍♂️🔥"),
