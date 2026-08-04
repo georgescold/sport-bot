@@ -6,9 +6,12 @@ bot.py — Bot Discord "Road to sub 38"
   !claude <demande>        → modification IA du sheet (langage naturel)
   Bouton ✅                → modale ressentis + km
   Bouton ❌                → séance non réalisée
+  8h00 quotidien           → séance du jour + note du coach + boutons de validation
   21h05 quotidien          → rappel si séance non renseignée (ou msg neutre si vide)
   21h00 dimanche           → résumé hebdomadaire + graphique Strava-like
-  6h00 quotidien           → note du coach du jour (colonne Notes Nico), 1 à la fois
+
+La note du coach (colonne « Notes Nico ») accompagne la séance partout où celle-ci
+est affichée, plutôt que dans un message séparé.
 """
 
 import os, re, json, asyncio, io, datetime
@@ -520,7 +523,6 @@ async def on_ready():
     # on_ready peut être rappelé à chaque reconnexion Gateway → tout doit être idempotent
     if not weekly_summary_task.is_running(): weekly_summary_task.start()
     if not evening_check_task.is_running():  evening_check_task.start()
-    if not coach_notes_task.is_running():    coach_notes_task.start()
     if not morning_reminder_task.is_running(): morning_reminder_task.start()
     bot.add_view(SeanceView())
     bot.add_view(StartCoursesView())
@@ -730,49 +732,12 @@ async def before_weekly():
     await bot.wait_until_ready()
 
 
-# ── TÂCHE 3 : NOTE DU COACH DU JOUR (Notes Nico) — 6h00 ──────────────────────
-# Livre la note du coach pour la séance DU JOUR, le matin même à 6h00, une seule
-# note à la fois. Ainsi Loys reçoit la consigne juste avant de s'entraîner et ne
-# se fait pas noyer par toutes les notes futures publiées d'un coup par le coach.
-@tasks.loop(time=datetime.time(hour=6, minute=0, tzinfo=PARIS))
-async def coach_notes_task():
-    """6h00 chaque jour : envoie la note du coach pour la séance du jour (si elle existe)."""
-    channel = bot.get_channel(DISCORD_CHANNEL_ID)
-    if not channel: return
-    try:
-        rows = await asyncio.to_thread(get_rows)
-        await asyncio.to_thread(backfill_dates, rows)   # garantit la ligne du jour
-        await asyncio.to_thread(backfill_types, rows)   # remplit la col E (type) si vide
-    except Exception as e:
-        print(f"⚠️ Note coach (lecture sheet) : {e}"); return
-
-    today_str = date.today().isoformat()
-    row_idx   = find_row(rows, today_str)
-    if row_idx is None:
-        return                                          # pas de ligne aujourd'hui → silence
-
-    row  = rows[row_idx]
-    nc   = notes_nico_col(rows)
-    note = row[nc].strip() if len(row) > nc else ""
-    if not note:
-        return                                          # pas de note ce jour → silence
-
-    jour    = row[COL_JOUR].strip() if len(row) > COL_JOUR else JOURS_FR[date.today().strftime("%A")]
-    date_fr = date.today().strftime("%d/%m/%Y")
-    note_disp = note if len(note) <= 1800 else note[:1799] + "…"
-    try:
-        await channel.send(
-            f"📝 <@{DISCORD_USER_ID}> **Note du coach Nico — {jour} {date_fr}**\n"
-            f"> {note_disp}")
-    except Exception as e:
-        print(f"⚠️ Note coach (envoi) : {e}")
-
-@coach_notes_task.before_loop
-async def before_coach_notes():
-    await bot.wait_until_ready()
+# L'ancienne TÂCHE 3 envoyait la note du coach seule à 6h00. Supprimée : la note
+# est désormais jointe à la séance elle-même (rappel 8h, rappel 21h05, !seance et
+# !seance semaine), donc lue dans son contexte plutôt que 2h avant. Cf. bloc_note().
 
 
-# ── TÂCHE 4 : RAPPEL DE SÉANCE DU MATIN — 8h00 ───────────────────────────────
+# ── TÂCHE 3 : RAPPEL DE SÉANCE DU MATIN — 8h00 ───────────────────────────────
 # Anciennement envoyé par la routine cloud claude.ai (`sport_bot.py --reminder`,
 # fenêtre 17h-18h). Rapatrié ici : le bot Railway tourne déjà 24/7, c'est plus
 # fiable et la planification est versionnée avec le code.
