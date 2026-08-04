@@ -216,6 +216,30 @@ def notes_nico_col(rows, default: int = COL_NOTES_NICO) -> int:
                 return i
     return default
 
+
+def note_coach(rows, row_idx) -> str:
+    """Note du coach (colonne « Notes Nico ») pour une ligne donnée. '' si absente."""
+    if row_idx is None or row_idx >= len(rows):
+        return ""
+    nc  = notes_nico_col(rows)
+    row = rows[row_idx]
+    return row[nc].strip() if len(row) > nc else ""
+
+
+def bloc_note(note: str, limite: int = 900) -> str:
+    """Bloc Discord de la note du coach, à coller sous une séance. '' si pas de note.
+
+    Chaque ligne est préfixée par « > » : les notes de Nico sont souvent
+    multi-lignes, et un seul « > » en tête ne citerait que la première ligne.
+    La limite protège le plafond de 2000 caractères d'un message Discord."""
+    if not note:
+        return ""
+    if len(note) > limite:
+        note = note[:limite - 1] + "…"
+    cite = "\n".join(f"> {ligne}" for ligne in note.splitlines())
+    return f"\n\n📝 **Note du coach Nico**\n{cite}"
+
+
 def parse_date(text):
     text = text.strip().lower(); y = date.today().year
     m = re.match(r"(\d{4})-(\d{2})-(\d{2})", text)
@@ -426,8 +450,14 @@ async def build_seance_response():
         return (f"<@{DISCORD_USER_ID}> Aucune séance trouvée pour aujourd'hui ({info['date']}) 🤔", None)
     if not info["seance"]:
         return (f"📅 Aucune séance programmée aujourd'hui ({date_fr}).", None)
+    # Note du coach relue à chaque appel, JAMAIS mise en cache : le cache de séance
+    # n'est invalidé que quand le bot modifie lui-même la séance, or Nico peut
+    # ajouter une note dans le sheet à n'importe quel moment de la journée.
+    rows = await asyncio.to_thread(get_rows)
+    note = await asyncio.to_thread(note_coach, rows, info["row_idx"])
     content = (f"🏃 Hey <@{DISCORD_USER_ID}> ! N'oublie pas de t'entraîner ! 💪\n\n"
-               f"**📅 Séance — {info['jour']} {date_fr}**\n> **{info['seance']}**\n\n"
+               f"**📅 Séance — {info['jour']} {date_fr}**\n> **{info['seance']}**"
+               f"{bloc_note(note)}\n\n"
                f"Clique sur un bouton une fois ta séance terminée 👇")
     return (content, SeanceView())
 
@@ -448,6 +478,7 @@ async def build_semaine_response() -> str:
     today = date.today()
     week_start = today - datetime.timedelta(days=today.weekday())   # lundi
     week_end   = week_start + datetime.timedelta(days=6)
+    nc    = notes_nico_col(rows)
     by_date = {row[0].strip(): row for row in rows[1:] if row and row[0].strip()}
     lines = []
     for i in range(7):
@@ -464,9 +495,20 @@ async def build_semaine_response() -> str:
             body = f"{seance} — ✅ {km} km" if km else seance
         marker = "👉 " if d == today else ""
         lines.append(f"{marker}**{jour_fr} {d.strftime('%d/%m')}** — {body}")
+        # Note du coach en version compacte : sur 7 jours, les notes intégrales
+        # feraient exploser le plafond de 2000 caractères d'un message Discord.
+        note = row[nc].strip() if row and len(row) > nc else ""
+        if note:
+            court = " ".join(note.split())
+            if len(court) > 160:
+                court = court[:159] + "…"
+            lines.append(f"　　📝 _{court}_")
     header = (f"📅 **Tes séances — semaine du {week_start.strftime('%d/%m')} "
               f"au {week_end.strftime('%d/%m')}**")
-    return header + "\n\n" + "\n".join(lines)
+    msg = header + "\n\n" + "\n".join(lines)
+    if len(msg) > 1990:                      # filet de sécurité : Discord rejette au-delà de 2000
+        msg = msg[:1989] + "…"
+    return msg
 
 
 _tree_synced = False
@@ -648,7 +690,8 @@ async def evening_check_task():
     view = SeanceView()
     await channel.send(
         content=(f"⏰ <@{DISCORD_USER_ID}> Tu n'as pas encore renseigné ta séance ! 👀\n\n"
-                 f"**📅 Rappel — {today_day} {date_fr}**\n> **{seance_txt}**\n\n"
+                 f"**📅 Rappel — {today_day} {date_fr}**\n> **{seance_txt}**"
+                 f"{bloc_note(note_coach(rows, row_idx))}\n\n"
                  f"Valide ta séance avant de dormir 👇"),
         view=view)
 
@@ -756,11 +799,13 @@ async def morning_reminder_task():
     jour    = row[COL_JOUR].strip()   if len(row) > COL_JOUR   else JOURS_FR[date.today().strftime("%A")]
     date_fr = date.today().strftime("%d/%m/%Y")
 
+    note = note_coach(rows, row_idx)   # consigne du coach livrée AVEC la séance
     try:
         await channel.send(
             content=(f"🏃 Hey <@{DISCORD_USER_ID}> ! N'oublie pas de t'entraîner ! 💪\n\n"
                      f"**📅 Séance — {jour} {date_fr}**\n"
-                     f"> **{seance}**\n\n"
+                     f"> **{seance}**"
+                     f"{bloc_note(note)}\n\n"
                      f"Clique sur un bouton une fois ta séance terminée 👇"),
             view=SeanceView())
     except Exception as e:
