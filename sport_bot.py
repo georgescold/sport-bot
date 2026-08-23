@@ -5,7 +5,6 @@ MODE --reminder      → envoie le rappel de séance Discord (DÉPRÉCIÉ : le r
                        désormais planifié à 8h00 par bot.py, tâche morning_reminder_task.
                        Ne plus appeler depuis la routine cloud → sinon double envoi.
                        Conservé pour un envoi manuel ponctuel.)
-MODE --scrape-races  → scrape jogging-plus et alimente l'onglet « Courses »
 
 Les helpers de l'onglet « Commandes » (ensure_commands_sheet, get_pending_commands,
 mark_command_done, format_sheet_context) sont utilisés par la routine cloud et
@@ -15,7 +14,6 @@ le bot Railway (bot.py).
 
 import argparse
 import os
-import re
 import sys
 from datetime import date, datetime, timedelta
 import requests
@@ -398,208 +396,15 @@ def format_sheet_context(rows) -> str:
 
 
 # ──────────────────────────────────────────────
-# COURSES — Calendrier des courses à venir
-# ──────────────────────────────────────────────
-COURSES_SHEET          = "Courses"
-JOGGING_PLUS_HDF       = "https://jogging-plus.com/calendrier/courses-5-10-15-km/hauts-de-france/"
-JOGGING_PLUS_GRAND_EST = "https://jogging-plus.com/calendrier/courses-5-10-15-km/grand-est/"
-
-# Départements prioritaires : Aisne(02), Ardennes(08), Marne(51), Oise(60), Somme(80)
-DEPTS_PRIORITAIRES = ["(02 ", "(08 ", "(51 ", "(60 ", "(80 "]
-# Nord (59) accepté seulement si proche de la frontière Aisne
-NORD_PROCHES = [
-    "awoingt", "quiévy", "quievy", "cambrai", "caudry",
-    "fourmies", "maubeuge", "colleret", "maing", "valenciennes",
-    "aulnoy", "trith", "bousies"
-]
-MOIS_NUM = {
-    "janvier": 1, "février": 2, "mars": 3, "avril": 4, "mai": 5, "juin": 6,
-    "juillet": 7, "août": 8, "septembre": 9, "octobre": 10, "novembre": 11, "décembre": 12
-}
-
-
-def ensure_courses_sheet():
-    svc   = get_sheets_service()
-    meta  = svc.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
-    titles = [s["properties"]["title"] for s in meta.get("sheets", [])]
-    if COURSES_SHEET in titles:
-        return
-    svc.spreadsheets().batchUpdate(
-        spreadsheetId=SPREADSHEET_ID,
-        body={"requests": [{"addSheet": {"properties": {"title": COURSES_SHEET}}}]}
-    ).execute()
-    svc.spreadsheets().values().update(
-        spreadsheetId=SPREADSHEET_ID,
-        range=f"'{COURSES_SHEET}'!A1:E1",
-        valueInputOption="RAW",
-        body={"values": [["Date", "Lieux", "Distance", "Autres informations", "Statut"]]}
-    ).execute()
-    print(f"  ✅ Onglet '{COURSES_SHEET}' créé.")
-
-
-def get_existing_courses():
-    svc = get_sheets_service()
-    res = svc.spreadsheets().values().get(
-        spreadsheetId=SPREADSHEET_ID,
-        range=f"'{COURSES_SHEET}'!A:E"
-    ).execute()
-    rows = res.get("values", [])
-    existing = set()
-    for r in rows[1:]:
-        lieux  = r[1].strip().lower() if len(r) > 1 else ""
-        autres = r[3].strip().lower() if len(r) > 3 else ""
-        existing.add(f"{lieux}|{autres[:40]}")
-    return existing
-
-
-def add_courses_to_sheet(courses):
-    if not courses:
-        return
-    svc    = get_sheets_service()
-    values = [
-        [c["date"], c["lieux"], c["distance"], c["info"], "nouveau"]
-        for c in courses
-    ]
-    svc.spreadsheets().values().append(
-        spreadsheetId=SPREADSHEET_ID,
-        range=f"'{COURSES_SHEET}'!A:E",
-        valueInputOption="RAW",
-        insertDataOption="INSERT_ROWS",
-        body={"values": values}
-    ).execute()
-
-
-def scrape_jogging_plus(url):
-    try:
-        from bs4 import BeautifulSoup
-    except ImportError:
-        import subprocess
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "beautifulsoup4",
-             "--break-system-packages", "-q"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
-        from bs4 import BeautifulSoup
-
-    ua   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    resp = requests.get(url, headers={"User-Agent": ua}, timeout=30)
-    soup = BeautifulSoup(resp.text, "html.parser")
-    today   = date.today()
-    results = []
-
-    for table in soup.find_all("table"):
-        for row in table.find_all("tr"):
-            cells = row.find_all("td")
-            if len(cells) < 3:
-                continue
-            date_txt   = cells[0].get_text(strip=True)
-            name_el    = cells[1].find("a")
-            name       = (name_el.get_text(strip=True) if name_el
-                          else cells[1].get_text(strip=True).split("\n")[0].strip())
-            link       = (name_el["href"] if name_el and name_el.get("href") else "")
-            cell_lines = [l.strip() for l in cells[1].get_text(separator="\n").splitlines() if l.strip()]
-            distance   = " / ".join(cell_lines[1:]) if len(cell_lines) > 1 else ""
-            location   = cells[2].get_text(strip=True)
-
-            if not name or "Aucune" in name:
-                continue
-
-            # Filtrage géographique
-            is_prio = any(dept in location for dept in DEPTS_PRIORITAIRES)
-            is_nord = ("(59 " in location and
-                       any(v in location.lower() for v in NORD_PROCHES))
-            if not is_prio and not is_nord:
-                continue
-
-            # Filtrage temporel — ignorer les dates passées
-            if date_txt and date_txt.lower() not in ("non connue", "à confirmer", ""):
-                past = False
-                for mois_fr, mois_num in MOIS_NUM.items():
-                    if mois_fr in date_txt.lower():
-                        m = re.search(r"(\d{1,2})", date_txt)
-                        if m:
-                            try:
-                                d_race = date(today.year, mois_num, int(m.group(1)))
-                                if d_race < today:
-                                    past = True
-                            except Exception:
-                                pass
-                        break
-                if past:
-                    continue
-
-            results.append({
-                "date":     date_txt if date_txt else "À confirmer",
-                "lieux":    location,
-                "distance": distance or "Voir détail",
-                "info":     f"{name} | {link}" if link else name,
-                "key":      f"{location.lower()}|{name.lower()[:40]}",
-            })
-
-    return results
-
-
-def run_scrape_races():
-    print(f"🏃 Scraping des courses — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    ensure_courses_sheet()
-    existing = get_existing_courses()
-    all_new  = []
-
-    for url in [JOGGING_PLUS_HDF, JOGGING_PLUS_GRAND_EST]:
-        print(f"  → {url}")
-        try:
-            races = scrape_jogging_plus(url)
-            print(f"     {len(races)} course(s) dans le périmètre")
-            for r in races:
-                if r["key"] not in existing:
-                    all_new.append(r)
-                    existing.add(r["key"])
-        except Exception as e:
-            print(f"  ❌ Erreur : {e}")
-
-    if not all_new:
-        print("  ✅ Aucune nouvelle course.")
-        return
-
-    add_courses_to_sheet(all_new)
-    print(f"  ✅ {len(all_new)} nouvelle(s) course(s) ajoutée(s).")
-
-    lines = [f"• **{r['date']}** — {r['lieux']} — {r['distance']}" for r in all_new[:15]]
-    if len(all_new) > 15:
-        lines.append(f"... et {len(all_new) - 15} autres")
-    # Bouton "Voir mes courses" : le clic est géré par le bot Railway
-    # (StartCoursesView, custom_id "start_courses_presentation").
-    send_payload({
-        "content": (
-            f"📅 <@{USER_ID}> **{len(all_new)} nouvelle(s) course(s)** ajoutée(s) au calendrier !\n"
-            + "\n".join(lines)
-            + "\n\nClique pour les passer en revue une par une 👇"
-        ),
-        "components": [{
-            "type": 1,
-            "components": [{
-                "type": 2,
-                "style": 3,
-                "label": "🏃 Voir mes courses",
-                "custom_id": "start_courses_presentation"
-            }]
-        }]
-    })
-
-
-# ──────────────────────────────────────────────
 # ENTRY POINT
 # ──────────────────────────────────────────────
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--reminder",     action="store_true")
-    parser.add_argument("--scrape-races", action="store_true")
     args = parser.parse_args()
 
     if args.reminder:
         run_reminder()
-    elif args.scrape_races:
-        run_scrape_races()
     else:
-        print("Usage: sport_bot.py --reminder | --scrape-races")
+        print("Usage: sport_bot.py --reminder")
         sys.exit(1)
