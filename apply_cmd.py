@@ -1,4 +1,4 @@
-"""apply_cmd.py — applique un plan JSON (stdin) sur le sheet + Discord.
+"""apply_cmd.py - applique un plan JSON (stdin) sur le sheet + Discord.
 
 Utilisé par la routine Claude qui traite les demandes !claude.
 Format du plan :
@@ -12,7 +12,7 @@ plan = json.load(sys.stdin)
 svc, rows, applied = sb.get_sheets_service(), sb.get_all_rows(), []
 
 # Colonnes protégées en écriture : date(0/A), jour(1/B), les agrégats I/J/K/L
-# (8..11 : Km_semaine / 7j glissant / mois / cumul annuel — calculés par formule,
+# (8..11 : Km_semaine / 7j glissant / mois / cumul annuel : calculés par formule,
 # toute écriture y détruirait la formule), + « Notes Nico » (colonne du COACH)
 # résolue par en-tête pour rester correcte après tout décalage.
 protected = {0, 1, 8, 9, 10, 11}

@@ -1,5 +1,5 @@
 """
-bot.py — Bot Discord "Road to sub 38"
+bot.py - Bot Discord "Road to sub 38"
   !seance                  → séance du jour avec boutons (instantané, cache du jour)
   !seance semaine          → récap de toutes les séances de la semaine (lun→dim)
   !programme <date> : <s>  → modifie le planning
@@ -39,14 +39,14 @@ SA_JSON            = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 PARIS = ZoneInfo("Europe/Paris")
 
 # Disposition « Données Loys » : A=date B=jour C=séance … F=ressentis
-# G="Notes Nico" (colonne du COACH — NE JAMAIS écrire) H=km_journee I=km_semaine
+# G="Notes Nico" (colonne du COACH : NE JAMAIS écrire) H=km_journee I=km_semaine
 COL_DATE       = 0   # A
 COL_JOUR       = 1   # B
 COL_SEANCE     = 2   # C
-COL_TYPE       = 4   # E — type de séance (déduit de C si vide ; coach prioritaire)
+COL_TYPE       = 4   # E : type de séance (déduit de C si vide ; coach prioritaire)
 COL_RESSENTIS  = 5   # F
-COL_NOTES_NICO = 6   # G — coach, lecture seule
-COL_KM_JOUR    = 7   # H — fallback ; la vraie colonne est résolue par km_jour_col()
+COL_NOTES_NICO = 6   # G : coach, lecture seule
+COL_KM_JOUR    = 7   # H : fallback ; la vraie colonne est résolue par km_jour_col()
 
 JOURS_FR = {
     "Monday":"Lundi","Tuesday":"Mardi","Wednesday":"Mercredi",
@@ -265,7 +265,7 @@ def format_sheet_context(rows) -> str:
         seance = row[2].strip() if len(row) > 2 else ""
         ress   = row[5].strip() if len(row) > 5 else ""
         km     = row[kmc].strip() if len(row) > kmc else ""
-        lines.append(f"{date_s} | {jour} | Séance: {seance or '—'} | Ressentis: {ress or '—'} | Km: {km or '—'}")
+        lines.append(f"{date_s} | {jour} | Séance: {seance or '-'} | Ressentis: {ress or '-'} | Km: {km or '-'}")
     return "\n".join(lines[-60:])
 
 # ── GRAPHIQUE STRAVA-LIKE ─────────────────────────────────────────────────────
@@ -402,7 +402,7 @@ class SeanceView(ui.View):
             return
         seance_txt = rows[row_idx][COL_SEANCE].strip() if len(rows[row_idx]) > COL_SEANCE else ""
         await asyncio.to_thread(write_cell, row_idx, COL_SEANCE,
-                                f"{seance_txt} — ❌ Non réalisée")
+                                f"{seance_txt} - ❌ Non réalisée")
         invalidate_seance_cache()
         await interaction.response.edit_message(
             content=(f"<@{DISCORD_USER_ID}> Pas de souci, c'est noté ! 💪\n"
@@ -459,7 +459,7 @@ async def build_seance_response():
     rows = await asyncio.to_thread(get_rows)
     note = await asyncio.to_thread(note_coach, rows, info["row_idx"])
     content = (f"🏃 Hey <@{DISCORD_USER_ID}> ! N'oublie pas de t'entraîner ! 💪\n\n"
-               f"**📅 Séance — {info['jour']} {date_fr}**\n> **{info['seance']}**"
+               f"**📅 Séance : {info['jour']} {date_fr}**\n> **{info['seance']}**"
                f"{bloc_note(note)}\n\n"
                f"Clique sur un bouton une fois ta séance terminée 👇")
     return (content, SeanceView())
@@ -495,9 +495,9 @@ async def build_semaine_response() -> str:
         elif "repos" in seance.lower():
             body = f"{seance} 😴"
         else:
-            body = f"{seance} — ✅ {km} km" if km else seance
+            body = f"{seance} (✅ {km} km)" if km else seance
         marker = "👉 " if d == today else ""
-        lines.append(f"{marker}**{jour_fr} {d.strftime('%d/%m')}** — {body}")
+        lines.append(f"{marker}**{jour_fr} {d.strftime('%d/%m')}** : {body}")
         # Note du coach en version compacte : sur 7 jours, les notes intégrales
         # feraient exploser le plafond de 2000 caractères d'un message Discord.
         note = row[nc].strip() if row and len(row) > nc else ""
@@ -506,7 +506,7 @@ async def build_semaine_response() -> str:
             if len(court) > 160:
                 court = court[:159] + "…"
             lines.append(f"　　📝 _{court}_")
-    header = (f"📅 **Tes séances — semaine du {week_start.strftime('%d/%m')} "
+    header = (f"📅 **Tes séances de la semaine du {week_start.strftime('%d/%m')} "
               f"au {week_end.strftime('%d/%m')}**")
     msg = header + "\n\n" + "\n".join(lines)
     if len(msg) > 1990:                      # filet de sécurité : Discord rejette au-delà de 2000
@@ -654,7 +654,7 @@ async def on_command_error(ctx, error):
 # ── TÂCHE 1 : RAPPEL 21h05 (tous les jours) ──────────────────────────────────
 @tasks.loop(time=datetime.time(hour=21, minute=5, tzinfo=PARIS))
 async def evening_check_task():
-    """Rappel si séance non renseignée — message neutre si aucune séance programmée."""
+    """Rappel si séance non renseignée ; message neutre si aucune séance programmée."""
     channel = bot.get_channel(DISCORD_CHANNEL_ID)
     if not channel: return
 
@@ -677,7 +677,7 @@ async def evening_check_task():
 
     # Case vide ou repos → message neutre, pas de tag
     if not seance_txt or "repos" in seance_txt.lower():
-        await channel.send(f"😴 Pas de séance programmée aujourd'hui — bonne récupération ! 🛋️")
+        await channel.send(f"😴 Pas de séance programmée aujourd'hui, bonne récupération ! 🛋️")
         return
 
     # Déjà répondu → rien faire
@@ -691,7 +691,7 @@ async def evening_check_task():
     view = SeanceView()
     await channel.send(
         content=(f"⏰ <@{DISCORD_USER_ID}> Tu n'as pas encore renseigné ta séance ! 👀\n\n"
-                 f"**📅 Rappel — {today_day} {date_fr}**\n> **{seance_txt}**"
+                 f"**📅 Rappel : {today_day} {date_fr}**\n> **{seance_txt}**"
                  f"{bloc_note(note_coach(rows, row_idx))}\n\n"
                  f"Valide ta séance avant de dormir 👇"),
         view=view)
@@ -716,7 +716,7 @@ async def weekly_summary_task():
     debut = week_start.strftime("%d/%m")
     fin   = week_end.strftime("%d/%m")
 
-    texte = (f"📊 **Résumé de la semaine — {debut} au {fin}**\n\n"
+    texte = (f"📊 **Résumé de la semaine du {debut} au {fin}**\n\n"
              f"🏃 **{km:.1f} km** parcourus cette semaine\n"
              f"✅ **{nb} séance(s)** réalisée(s)\n\n"
              f"<@{DISCORD_USER_ID}> Belle semaine, continue comme ça ! 💪")
@@ -736,7 +736,7 @@ async def before_weekly():
 # !seance semaine), donc lue dans son contexte plutôt que 2h avant. Cf. bloc_note().
 
 
-# ── TÂCHE 3 : RAPPEL DE SÉANCE DU MATIN — 8h00 ───────────────────────────────
+# ── TÂCHE 3 : RAPPEL DE SÉANCE DU MATIN : 8h00 ───────────────────────────────
 # Anciennement envoyé par la routine cloud claude.ai (`sport_bot.py --reminder`,
 # fenêtre 17h-18h). Rapatrié ici : le bot Railway tourne déjà 24/7, c'est plus
 # fiable et la planification est versionnée avec le code.
@@ -767,7 +767,7 @@ async def morning_reminder_task():
     try:
         await channel.send(
             content=(f"🏃 Hey <@{DISCORD_USER_ID}> ! N'oublie pas de t'entraîner ! 💪\n\n"
-                     f"**📅 Séance — {jour} {date_fr}**\n"
+                     f"**📅 Séance : {jour} {date_fr}**\n"
                      f"> **{seance}**"
                      f"{bloc_note(note)}\n\n"
                      f"Clique sur un bouton une fois ta séance terminée 👇"),

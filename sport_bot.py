@@ -1,5 +1,5 @@
 """
-sport_bot.py — Outils de la routine cloud
+sport_bot.py - Outils de la routine cloud
 -----------------------------------------
 MODE --reminder      → envoie le rappel de séance Discord (DÉPRÉCIÉ : le rappel est
                        désormais planifié à 8h00 par bot.py, tâche morning_reminder_task.
@@ -31,16 +31,16 @@ USER_ID              = "340479270449315840"
 SERVICE_ACCOUNT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         "gen-lang-client-0218641615-b114179ddeb2.json")
 
-# Colonnes (index 0-based) — disposition « Données Loys » :
+# Colonnes (index 0-based) : disposition « Données Loys » :
 # A=date B=jour C=séance … F=ressentis
-# G="Notes Nico" (colonne du COACH — NE JAMAIS écrire) H=km_journee I=km_semaine
+# G="Notes Nico" (colonne du COACH : NE JAMAIS écrire) H=km_journee I=km_semaine
 COL_DATE       = 0   # A
 COL_JOUR       = 1   # B
 COL_SEANCE     = 2   # C
-COL_TYPE       = 4   # E — type de séance (déduit de C si vide ; coach prioritaire)
+COL_TYPE       = 4   # E : type de séance (déduit de C si vide ; coach prioritaire)
 COL_RESSENTIS  = 5   # F
-COL_NOTES_NICO = 6   # G — coach, lecture seule
-COL_KM_JOUR    = 7   # H — fallback ; la vraie colonne est résolue par km_jour_col()
+COL_NOTES_NICO = 6   # G : coach, lecture seule
+COL_KM_JOUR    = 7   # H : fallback ; la vraie colonne est résolue par km_jour_col()
 
 DISCORD_API = "https://discord.com/api/v10"
 
@@ -261,7 +261,7 @@ def build_reminder_payload(seance: str, jour: str, date_fr: str, row_index: int)
     return {
         "content": (
             f"🏃 Hey <@{USER_ID}> ! N'oublie pas de t'entraîner ! 💪\n\n"
-            f"**📅 Séance — {jour} {date_fr}**\n"
+            f"**📅 Séance : {jour} {date_fr}**\n"
             f"> **{seance}**\n\n"
             f"Clique sur un bouton une fois ta séance terminée 👇"
         ),
@@ -291,7 +291,7 @@ def build_reminder_payload(seance: str, jour: str, date_fr: str, row_index: int)
 # MODE REMINDER (--reminder)
 # ──────────────────────────────────────────────
 def run_reminder():
-    print(f"🏃 MODE REMINDER — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"🏃 MODE REMINDER : {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
     rows = get_all_rows()
     svc_bf = get_sheets_service()
@@ -322,7 +322,7 @@ def run_reminder():
 
 
 # ──────────────────────────────────────────────
-# ONGLET « COMMANDES » — helpers routine cloud + apply_cmd.py
+# ONGLET « COMMANDES » : helpers routine cloud + apply_cmd.py
 # ──────────────────────────────────────────────
 COMMANDS_SHEET = "Commandes"
 
@@ -389,8 +389,8 @@ def format_sheet_context(rows) -> str:
         ress   = row[5].strip() if len(row) > 5 else ""
         km     = row[kmc].strip() if len(row) > kmc else ""
         lines.append(
-            f"{date_s} | {jour} | Séance: {seance or '—'} | "
-            f"Ressentis: {ress or '—'} | Km: {km or '—'}"
+            f"{date_s} | {jour} | Séance: {seance or '-'} | "
+            f"Ressentis: {ress or '-'} | Km: {km or '-'}"
         )
     return "\n".join(lines[-60:])
 
