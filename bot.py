@@ -7,6 +7,8 @@ bot.py - Bot Discord "Road to sub 38"
   Bouton ✅                → modale ressentis + km
   Bouton ❌                → séance non réalisée
   8h00 quotidien           → séance du jour + note du coach + boutons de validation
+                             (jour de repos → propose une séance de muscu à saisir)
+  toutes les 30 min        → prévient si le coach modifie la journée après 8h00
   21h05 quotidien          → rappel si séance non renseignée (ou msg neutre si vide)
   21h00 dimanche           → résumé hebdomadaire + graphique Strava-like
 
@@ -293,7 +295,7 @@ def get_weekly_data():
             except: pass
         seance = row[COL_SEANCE].strip() if len(row) > COL_SEANCE else ""
         km_by_week[wk] = km_by_week.get(wk, 0.0) + km_val
-        is_rest = "repos" in seance.lower() or seance == "" or "Non réalisée" in seance
+        is_rest = est_repos(seance) or "Non réalisée" in seance
         if km_val > 0 or (not is_rest and seance):
             seances_by_week[wk] = seances_by_week.get(wk, 0) + 1
 
@@ -375,6 +377,79 @@ class RessentisModal(ui.Modal, title="🏃 Ta séance du jour"):
             view=None)
 
 
+# ── CE QUI A ÉTÉ ANNONCÉ SUR DISCORD AUJOURD'HUI ─────────────────────────────
+# Photo de la séance (col C) et de la consigne du coach (col G) au moment où le
+# bot les a annoncées. seance_watch_task compare le Sheet à cette photo : si Nico
+# retouche la journée après le rappel de 8h00, Loys est prévenu au lieu de courir
+# la mauvaise séance. En mémoire seulement : après un redéploiement, le premier
+# passage se contente de reprendre la photo, sans notifier.
+_annonce: dict = {}
+
+def set_annonce(seance: str, note: str = "", d: str = None):
+    """Mémorise l'état annoncé. À appeler APRÈS chaque écriture du bot en col C,
+    sinon la surveillance prendrait le bot lui-même pour le coach."""
+    _annonce.update({"date":   d or date.today().isoformat(),
+                     "seance": (seance or "").strip(),
+                     "note":   (note or "").strip()})
+
+
+def est_repos(seance: str) -> bool:
+    """Journée sans séance de course programmée (case vide ou repos)."""
+    return (not (seance or "").strip()) or seance_type(seance) == "Repos"
+
+
+class MuscuModal(ui.Modal, title="💪 Ta séance de muscu"):
+    """Jour de repos : Loys saisit lui-même la séance qu'il veut faire."""
+    contenu = ui.TextInput(label="Ton programme",
+        style=discord.TextStyle.paragraph,
+        placeholder="Ex: Pompes 3x15, DC barre 4x10 (récup 3'), tractions 4x8, gainage 3x1'",
+        min_length=3, max_length=1000)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        today_str = date.today().isoformat()
+        rows      = await asyncio.to_thread(get_rows)
+        row_idx   = find_row(rows, today_str)
+        if row_idx is None:
+            await interaction.response.send_message(
+                "❌ Aucune ligne pour aujourd'hui dans le planning, impossible d'écrire.",
+                ephemeral=True)
+            return
+        # Le mot « repos » est volontairement remplacé : la journée devient une
+        # vraie séance pour tout le reste du bot (relance 21h05, récap hebdo,
+        # graphe) qui teste la présence de « repos » dans la col C.
+        texte = f"renfo muscu : {str(self.contenu).strip()}"
+        await asyncio.to_thread(write_cell, row_idx, COL_SEANCE, texte)
+        await asyncio.to_thread(write_cell, row_idx, COL_TYPE, "Renfo")
+        invalidate_seance_cache()
+        set_annonce(texte, _annonce.get("note", ""))
+        jour = JOURS_FR[date.today().strftime("%A")]
+        await interaction.response.edit_message(
+            content=(f"💪 <@{DISCORD_USER_ID}> C'est noté dans le planning !\n\n"
+                     f"**📅 Séance : {jour} {date.today().strftime('%d/%m/%Y')}**\n"
+                     f"> **{texte}**\n\n"
+                     f"Clique sur un bouton une fois la séance terminée 👇"),
+            view=SeanceView())
+
+
+class ReposView(ui.View):
+    """Vue persistante des jours de repos : propose d'ajouter une muscu."""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @ui.button(label="💪 Je fais une muscu", style=discord.ButtonStyle.primary,
+               custom_id="btn_repos_muscu")
+    async def muscu(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.send_modal(MuscuModal())
+
+    @ui.button(label="🛋️ Vraie récup", style=discord.ButtonStyle.secondary,
+               custom_id="btn_repos_off")
+    async def recup(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.edit_message(
+            content=(f"🛋️ <@{DISCORD_USER_ID}> Repos complet aujourd'hui, "
+                     f"la récup fait partie du plan. À demain !"),
+            view=None)
+
+
 class SeanceView(ui.View):
     """Vue persistante : trouve la ligne du jour dynamiquement."""
     def __init__(self):
@@ -404,6 +479,7 @@ class SeanceView(ui.View):
         await asyncio.to_thread(write_cell, row_idx, COL_SEANCE,
                                 f"{seance_txt} - ❌ Non réalisée")
         invalidate_seance_cache()
+        set_annonce(f"{seance_txt} - ❌ Non réalisée", _annonce.get("note", ""))
         await interaction.response.edit_message(
             content=(f"<@{DISCORD_USER_ID}> Pas de souci, c'est noté ! 💪\n"
                      f"Séance marquée comme non réalisée. À demain !"),
@@ -451,13 +527,16 @@ async def build_seance_response():
     date_fr = date.today().strftime("%d/%m/%Y")
     if info["row_idx"] is None:
         return (f"<@{DISCORD_USER_ID}> Aucune séance trouvée pour aujourd'hui ({info['date']}) 🤔", None)
-    if not info["seance"]:
-        return (f"📅 Aucune séance programmée aujourd'hui ({date_fr}).", None)
     # Note du coach relue à chaque appel, JAMAIS mise en cache : le cache de séance
     # n'est invalidé que quand le bot modifie lui-même la séance, or Nico peut
     # ajouter une note dans le sheet à n'importe quel moment de la journée.
     rows = await asyncio.to_thread(get_rows)
     note = await asyncio.to_thread(note_coach, rows, info["row_idx"])
+    if est_repos(info["seance"]):
+        return ((f"😴 <@{DISCORD_USER_ID}> Aujourd'hui c'est repos !\n\n"
+                 f"**📅 Repos : {info['jour']} {date_fr}**"
+                 f"{bloc_note(note)}\n\n"
+                 f"Tu veux quand même faire une séance de muscu ? 👇"), ReposView())
     content = (f"🏃 Hey <@{DISCORD_USER_ID}> ! N'oublie pas de t'entraîner ! 💪\n\n"
                f"**📅 Séance : {info['jour']} {date_fr}**\n> **{info['seance']}**"
                f"{bloc_note(note)}\n\n"
@@ -524,7 +603,9 @@ async def on_ready():
     if not weekly_summary_task.is_running(): weekly_summary_task.start()
     if not evening_check_task.is_running():  evening_check_task.start()
     if not morning_reminder_task.is_running(): morning_reminder_task.start()
+    if not seance_watch_task.is_running(): seance_watch_task.start()
     bot.add_view(SeanceView())
+    bot.add_view(ReposView())
     # Les slash commands ont été retirées (tout passe par !seance / !programme /
     # !claude) : on synchronise un arbre vide pour les désenregistrer de Discord.
     if not _tree_synced:
@@ -575,6 +656,7 @@ async def apply_programme(date_raw: str, seance: str) -> str:
     await asyncio.to_thread(write_cell, row_idx, COL_SEANCE, seance)
     if date_iso == date.today().isoformat():
         invalidate_seance_cache()
+        set_annonce(seance, _annonce.get("note", ""))
     try:
         d = date.fromisoformat(date_iso)
         affiche = f"{JOURS_FR[d.strftime('%A')]} {d.strftime('%d/%m/%Y')}"
@@ -676,7 +758,7 @@ async def evening_check_task():
     seance_txt = row[COL_SEANCE].strip() if len(row) > COL_SEANCE else ""
 
     # Case vide ou repos → message neutre, pas de tag
-    if not seance_txt or "repos" in seance_txt.lower():
+    if est_repos(seance_txt):
         await channel.send(f"😴 Pas de séance programmée aujourd'hui, bonne récupération ! 🛋️")
         return
 
@@ -764,20 +846,88 @@ async def morning_reminder_task():
     date_fr = date.today().strftime("%d/%m/%Y")
 
     note = note_coach(rows, row_idx)   # consigne du coach livrée AVEC la séance
+    if est_repos(seance):
+        # Jour de repos : on propose une muscu plutôt que d'envoyer un rappel vide.
+        content = (f"😴 <@{DISCORD_USER_ID}> Aujourd'hui c'est repos !\n\n"
+                   f"**📅 Repos : {jour} {date_fr}**"
+                   f"{bloc_note(note)}\n\n"
+                   f"Tu veux quand même faire une séance de muscu ? 👇")
+        view = ReposView()
+    else:
+        content = (f"🏃 Hey <@{DISCORD_USER_ID}> ! N'oublie pas de t'entraîner ! 💪\n\n"
+                   f"**📅 Séance : {jour} {date_fr}**\n"
+                   f"> **{seance}**"
+                   f"{bloc_note(note)}\n\n"
+                   f"Clique sur un bouton une fois ta séance terminée 👇")
+        view = SeanceView()
     try:
-        await channel.send(
-            content=(f"🏃 Hey <@{DISCORD_USER_ID}> ! N'oublie pas de t'entraîner ! 💪\n\n"
-                     f"**📅 Séance : {jour} {date_fr}**\n"
-                     f"> **{seance}**"
-                     f"{bloc_note(note)}\n\n"
-                     f"Clique sur un bouton une fois ta séance terminée 👇"),
-            view=SeanceView())
+        await channel.send(content=content, view=view)
+        set_annonce(seance, note)   # point de départ de la surveillance du jour
     except Exception as e:
         print(f"⚠️ Rappel matin (envoi) : {e}")
 
 
 @morning_reminder_task.before_loop
 async def before_morning_reminder():
+    await bot.wait_until_ready()
+
+
+# ── TÂCHE 4 : LE COACH A-T-IL MODIFIÉ LA JOURNÉE ? (toutes les 30 min) ───────
+WATCH_DEBUT, WATCH_FIN = 9, 21        # fenêtre de surveillance, heures de Paris
+
+@tasks.loop(minutes=30)
+async def seance_watch_task():
+    """Prévient Loys si la séance du jour (col C) ou la consigne du coach (col G)
+    change APRÈS le rappel de 8h00. Nico retouche parfois le planning en cours de
+    journée : sans ça, Loys part sur la séance annoncée le matin."""
+    now = datetime.datetime.now(PARIS)
+    if not (WATCH_DEBUT <= now.hour < WATCH_FIN):
+        return
+    channel = bot.get_channel(DISCORD_CHANNEL_ID)
+    if not channel: return
+
+    today_str = date.today().isoformat()
+    try:
+        rows = await asyncio.to_thread(get_rows)
+    except Exception as e:
+        print(f"⚠️ Surveillance séance (lecture sheet) : {e}"); return
+    row_idx = find_row(rows, today_str)
+    if row_idx is None: return
+
+    row    = rows[row_idx]
+    seance = row[COL_SEANCE].strip() if len(row) > COL_SEANCE else ""
+    note   = note_coach(rows, row_idx)
+
+    # Premier passage de la journée (ou après un redéploiement) : on prend la
+    # photo sans rien annoncer, on ne sait pas ce qui a changé avant.
+    if _annonce.get("date") != today_str:
+        set_annonce(seance, note, today_str)
+        return
+
+    avant, avant_note = _annonce.get("seance", ""), _annonce.get("note", "")
+    if seance == avant and note == avant_note:
+        return
+
+    set_annonce(seance, note, today_str)
+    invalidate_seance_cache()
+
+    blocs = []
+    if seance != avant:
+        blocs.append(f"**La séance a changé**\n"
+                     f"> ~~{avant or 'case vide'}~~\n"
+                     f"> **{seance or 'case vide'}**")
+    if note != avant_note:
+        blocs.append("**Nouvelle consigne du coach**" +
+                     (bloc_note(note) or f"\n> _consigne retirée_"))
+    heure = now.strftime("%Hh%M")
+    await channel.send(
+        content=(f"✏️ <@{DISCORD_USER_ID}> Nico a modifié ta journée depuis le "
+                 f"rappel de 8h00 (vu à {heure}) !\n\n" + f"\n\n".join(blocs)),
+        view=ReposView() if est_repos(seance) else SeanceView())
+
+
+@seance_watch_task.before_loop
+async def before_seance_watch():
     await bot.wait_until_ready()
 
 
