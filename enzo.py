@@ -472,18 +472,23 @@ async def propositions_task():
 
 
 # ── TACHES QUOTIDIENNES ───────────────────────────────────────────────────────
-@tasks.loop(time=datetime.time(hour=8, minute=0, tzinfo=PARIS))
-async def rappel_matin_task():
-    channel = _bot.get_channel(CHANNEL_ID) if _bot else None
-    if not channel:
-        return
+async def envoyer_seance(channel, rappel=True):
+    """Poste la seance du jour d'Enzo. Partage par la tache de 8h00 et par la
+    commande !seance tapee dans SON salon."""
     try:
         rows = await asyncio.to_thread(get_rows)
     except Exception as e:
-        print(f"⚠️ Enzo, rappel matin : {e}"); return
+        print(f"⚠️ Enzo, lecture du planning : {e}")
+        if not rappel:
+            await channel.send("❌ Impossible de lire le planning pour l'instant.")
+        return
     today = date.today()
     idx = find_row(rows, today.isoformat())
     if idx is None:
+        if not rappel:
+            await channel.send(
+                f"📅 Aucune séance au programme aujourd'hui ({today.strftime('%d/%m/%Y')}). "
+                f"Le programme court du 31/08 au 22/11/2026.")
         return                      # hors periode de programme, on ne dit rien
     row     = rows[idx]
     seance  = cell(row, COL_SEANCE)
@@ -496,12 +501,20 @@ async def rappel_matin_task():
             f"😴 <@{USER_ID}> Aujourd'hui c'est repos ({jour} {date_fr}).\n"
             f"La récupération fait partie du programme, profites-en. 🛋️")
         return
+    entete = "💪 Hey <@%d> ! Ta séance du jour 👇" % USER_ID if rappel else "💪 Séance du jour"
     await channel.send(
-        content=(f"💪 Hey <@{USER_ID}> ! Ta séance du jour 👇\n\n"
+        content=(f"{entete}\n\n"
                  f"**📅 {jour} {date_fr}**  ·  _{bloc}_\n"
                  f"{tableau_seance(seance)}\n\n"
                  f"Clique sur un bouton une fois la séance terminée."),
         view=SeanceView())
+
+
+@tasks.loop(time=datetime.time(hour=8, minute=0, tzinfo=PARIS))
+async def rappel_matin_task():
+    channel = _bot.get_channel(CHANNEL_ID) if _bot else None
+    if channel:
+        await envoyer_seance(channel, rappel=True)
 
 
 @tasks.loop(time=datetime.time(hour=21, minute=5, tzinfo=PARIS))
@@ -529,6 +542,91 @@ async def relance_soir_task():
         view=SeanceView())
 
 
+# ── COMMANDES TAPEES DANS LE SALON D'ENZO ────────────────────────────────────
+# bot.py aiguille : une commande tapee dans #sport-enzo arrive ici et ne touche
+# QUE le classeur d'Enzo. Une commande tapee dans le salon de Loys n'arrive
+# jamais ici. Aucune des deux ne peut atteindre l'autre athlete.
+
+_prochain_run = None      # fonction fournie par bot.py, pour annoncer l'heure
+
+
+async def commande_semaine(channel):
+    """!seance semaine : recap de la semaine d'Enzo, une ligne par jour."""
+    rows = await asyncio.to_thread(get_rows)
+    today = date.today()
+    lundi = today - datetime.timedelta(days=today.weekday())
+    lignes = []
+    for i in range(7):
+        d = lundi + datetime.timedelta(days=i)
+        idx = find_row(rows, d.isoformat())
+        jour = JOURS_FR[d.strftime("%A")]
+        marque = "👉 " if d == today else ""
+        if idx is None:
+            lignes.append(f"{marque}**{jour} {d.strftime('%d/%m')}** : _hors programme_")
+            continue
+        r = rows[idx]
+        seance = cell(r, COL_SEANCE)
+        fait = cell(r, COL_CHARGES) or cell(r, COL_KM)
+        etat = "  ✅" if fait else ""
+        lignes.append(f"{marque}**{jour} {d.strftime('%d/%m')}** : "
+                      f"{resume_seance(seance) or '_rien de programmé_'}{etat}")
+    await channel.send(f"📅 **Semaine du {lundi.strftime('%d/%m')} "
+                       f"au {(lundi + datetime.timedelta(days=6)).strftime('%d/%m')}**\n\n"
+                       + "\n".join(lignes))
+
+
+async def commande_claude(channel, auteur_id, demande):
+    """!claude dans le salon d'Enzo : depose la demande dans SON onglet Commandes."""
+    if not demande.strip():
+        await channel.send("Utilisation : `!claude <ta question ou ta demande>`")
+        return
+    try:
+        rows = await asyncio.to_thread(get_rows)
+        idx = find_row(rows, date.today().isoformat())
+        contexte = contexte_recent(rows, idx if idx is not None else len(rows) - 1)
+        qui = "Loys (le coach)" if auteur_id == COACH_ID else "Enzo"
+        texte = (f"COACH ENZO. Demande libre de {qui} depuis le salon Discord d'Enzo :\n"
+                 f"{demande.strip()}\n\nHISTORIQUE :\n{contexte}")
+        await asyncio.to_thread(deposer_demande, texte)
+    except Exception as e:
+        await channel.send(f"❌ Erreur : {e}")
+        return
+    if _prochain_run:
+        run = int(_prochain_run().timestamp())
+        await channel.send(f"✍️ Demande transmise au coach. Réponse au prochain "
+                           f"passage : <t:{run}:t>, soit <t:{run}:R> ⏳")
+    else:
+        await channel.send("✍️ Demande transmise au coach.")
+
+
+async def commande_programme(channel, auteur_id, date_raw, seance):
+    """!programme dans le salon d'Enzo : reserve au coach, ecrit dans SON planning."""
+    if COACH_ID and auteur_id != COACH_ID:
+        await channel.send("Seul le coach peut modifier le planning d'Enzo.")
+        return
+    d_iso = None
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d/%m"):
+        try:
+            d = datetime.datetime.strptime(date_raw.strip(), fmt).date()
+            if fmt == "%d/%m":
+                d = d.replace(year=date.today().year)
+            d_iso = d.isoformat()
+            break
+        except ValueError:
+            continue
+    if not d_iso:
+        await channel.send(f"Date `{date_raw}` non reconnue. Essaie `2026-09-14` ou `14/09`.")
+        return
+    rows = await asyncio.to_thread(get_rows)
+    idx = find_row(rows, d_iso)
+    if idx is None:
+        await channel.send(f"Aucune ligne au {d_iso} dans le planning d'Enzo.")
+        return
+    await asyncio.to_thread(write_cell, idx, COL_SEANCE, seance)
+    await channel.send(f"✅ Planning d'Enzo mis à jour pour le **{d_iso}** :\n"
+                       f"{tableau_seance(seance)}")
+
+
 # ── DEMARRAGE, APPELE PAR bot.py ──────────────────────────────────────────────
 def reveiller_propositions():
     """Les boutons d'une proposition portent un custom_id indexe sur sa ligne, donc
@@ -543,10 +641,11 @@ def reveiller_propositions():
         print(f"⚠️ Enzo, reveil des propositions : {e}")
 
 
-def init(bot_instance):
+def init(bot_instance, prochain_run=None):
     """Enregistre les vues persistantes et demarre les taches. Idempotent :
     on_ready est rejoue a chaque reconnexion Gateway."""
-    global _bot
+    global _bot, _prochain_run
+    _prochain_run = prochain_run or _prochain_run
     if _bot is None:
         reveiller_propositions()
     _bot = bot_instance

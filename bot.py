@@ -617,7 +617,7 @@ async def on_ready():
     bot.add_view(ReposView())
     if enzo:
         try:
-            enzo.init(bot)
+            enzo.init(bot, prochain_run=next_routine_run)
         except Exception as e:
             print(f"⚠️ Demarrage du suivi d'Enzo : {e}")
     # Les slash commands ont été retirées (tout passe par !seance / !programme /
@@ -646,13 +646,35 @@ async def on_ready():
                                   name="ton plan d'entraînement 🏃"))
 
 
+# ── AIGUILLAGE DES COMMANDES PAR SALON ───────────────────────────────────────
+# Une commande tapee dans le salon d'un athlete ne doit toucher QUE cet athlete.
+# salon_de(ctx) renvoie "loys", "enzo", ou None si la commande vient d'ailleurs
+# (auquel cas le bot reste muet). C'est le seul endroit ou l'on decide a qui
+# appartient une commande : chaque commande l'appelle en premiere ligne.
+def salon_de(ctx):
+    if ctx.channel.id == DISCORD_CHANNEL_ID:
+        return "loys"
+    if enzo and ctx.channel.id == enzo.CHANNEL_ID:
+        return "enzo"
+    return None
+
+
 @bot.command(name="seance")
 async def cmd_seance(ctx, *, arg: str = ""):
-    """!seance → séance du jour (boutons) · !seance semaine → récap de la semaine."""
-    if ctx.channel.id != DISCORD_CHANNEL_ID: return
+    """!seance → séance du jour (boutons) · !seance semaine → récap de la semaine.
+    Fonctionne dans les deux salons, chacun sur SON planning."""
+    salon = salon_de(ctx)
+    if salon is None: return
     try: await ctx.message.delete()
     except: pass
-    if arg.strip().lower().startswith(("semaine", "sem", "week")):
+    semaine = arg.strip().lower().startswith(("semaine", "sem", "week"))
+    if salon == "enzo":
+        if semaine:
+            await enzo.commande_semaine(ctx.channel)
+        else:
+            await enzo.envoyer_seance(ctx.channel, rappel=False)
+        return
+    if semaine:
         await ctx.channel.send(await build_semaine_response())
     else:
         await send_seance_msg(ctx.channel)
@@ -680,11 +702,17 @@ async def apply_programme(date_raw: str, seance: str) -> str:
 
 @bot.command(name="programme")
 async def cmd_programme(ctx, *, args: str = ""):
-    """!programme <date> : <séance> → modifie une ligne du planning."""
-    if ctx.channel.id != DISCORD_CHANNEL_ID: return
+    """!programme <date> : <séance> → modifie une ligne du planning.
+    Dans le salon d'Enzo, ecrit dans SON planning et seul le coach y a droit."""
+    salon = salon_de(ctx)
+    if salon is None: return
     m = re.match(r"(.+?)\s*:\s*(.+)", args)
     if not m:
         await ctx.reply("Format : `!programme <date> : <séance>`\nEx: `!programme mardi 16 juin : footing 30min`")
+        return
+    if salon == "enzo":
+        await enzo.commande_programme(ctx.channel, ctx.author.id,
+                                      m.group(1).strip(), m.group(2).strip())
         return
     await ctx.reply(await apply_programme(m.group(1).strip(), m.group(2).strip()))
 
@@ -714,8 +742,13 @@ def next_routine_run() -> datetime.datetime:
 
 @bot.command(name="claude")
 async def cmd_claude(ctx, *, request: str = ""):
-    """!claude <demande> → enregistre dans l'onglet Commandes pour traitement Cowork."""
-    if ctx.channel.id != DISCORD_CHANNEL_ID: return
+    """!claude <demande> → enregistre dans l'onglet Commandes pour traitement Cowork.
+    Dans le salon d'Enzo, la demande part dans SON onglet Commandes."""
+    salon = salon_de(ctx)
+    if salon is None: return
+    if salon == "enzo":
+        await enzo.commande_claude(ctx.channel, ctx.author.id, request)
+        return
     if not request:
         await ctx.reply(
             "Dis-moi ce que tu veux modifier ! 💬\n"
