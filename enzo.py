@@ -16,7 +16,7 @@ l'onglet « Commandes » du classeur d'Enzo, et la routine cloud claude.ai la
 traite au prochain passage (elle tourne sous l'abonnement de Loys).
 """
 
-import os, json, asyncio, datetime
+import os, re, json, asyncio, datetime
 from datetime import date
 from zoneinfo import ZoneInfo
 
@@ -40,6 +40,11 @@ SA_JSON        = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 COACH_ID = int(os.environ.get("DISCORD_USER_ID", "0"))
 
 PARIS = ZoneInfo("Europe/Paris")
+
+def aujourdhui():
+    """Le jour vecu par l'athlete, pas celui du serveur. Railway tourne en UTC :
+    entre minuit et 2h du matin a Paris, date.today() renverrait encore la veille."""
+    return datetime.datetime.now(PARIS).date()
 
 # Colonnes de « Données Enzo » (0-based). Differentes de celles de Loys.
 COL_DATE, COL_JOUR, COL_MOIS   = 0, 1, 2
@@ -103,7 +108,9 @@ def est_course(type_seance):
 LARGEURS = (22, 11, 4, 6)          # exercice, series, RPE, recup : 49 colonnes
 
 def _tronque(txt, n):
-    txt = txt.strip()
+    # Les accents graves fermeraient le bloc de code Discord et disloqueraient
+    # tout le message : ils sont neutralises avant tout affichage.
+    txt = txt.strip().replace("`", "'")
     return txt if len(txt) <= n else txt[:n - 1] + "."
 
 def tableau_seance(seance: str) -> str:
@@ -114,7 +121,7 @@ def tableau_seance(seance: str) -> str:
     exos = [e.strip() for e in reste.split(" · ") if e.strip()] if reste else []
     # Seance libre (course, texte du coach non structure) : pas de tableau.
     if not exos or not any("|" in e for e in exos):
-        return f"> **{seance}**"
+        return f"> **{seance.replace('`', chr(39))}**"
 
     le, ls, lr, lc = LARGEURS
     lignes = [f"{'EXERCICE':<{le}}  {'SÉRIES':<{ls}}  {'RPE':<{lr}}  {'RÉC.':<{lc}}",
@@ -194,7 +201,7 @@ class SeanceView(ui.View):
 
     async def _ligne_du_jour(self):
         rows = await asyncio.to_thread(get_rows)
-        return rows, find_row(rows, date.today().isoformat())
+        return rows, find_row(rows, aujourdhui().isoformat())
 
     @ui.button(label="✅ Séance faite", style=discord.ButtonStyle.success,
                custom_id="enzo_valider")
@@ -253,7 +260,7 @@ def chercher_report(rows, idx):
         origine = _lundi(cell(rows[idx], COL_DATE))
     except ValueError:
         return None
-    aujourdhui = date.today()
+    ce_jour = aujourdhui()
     for i in range(idx + 1, len(rows)):
         r = rows[i]
         d_txt = cell(r, COL_DATE)
@@ -265,7 +272,7 @@ def chercher_report(rows, idx):
             continue
         if _lundi(d_txt) != origine:      # on ne deborde pas sur la semaine suivante
             return None
-        if d <= aujourdhui:
+        if d <= ce_jour:
             continue
         if est_repos(cell(r, COL_SEANCE)) and cell(r, COL_TYPE).lower() == "repos":
             return i
@@ -305,8 +312,17 @@ def seances_manquees_recentes(rows, idx, fenetre=7):
 
 
 # ── COACH : DEPOT D'UNE DEMANDE POUR LA ROUTINE CLOUD ─────────────────────────
-MOTS_ALERTE = ("douleur", "mal ", "blessure", "genou", "dos", "épaule", "epaule",
-               "tendon", "gêne", "gene ", "boiter")
+# Detection par MOTS ENTIERS, jamais par sous-chaine : « normal mais », « animal »
+# et « mal dormi » declenchaient tous une fausse alerte douleur. Les parties du
+# corps seules ne comptent pas non plus, « j'ai bossé le dos » est une seance
+# normale : c'est la tournure « mal a/au » qui signale la plainte.
+ALERTE = re.compile(
+    r"\b(douleurs?|douloureu|blessure|bless[ée]|tendinite|tendinopathie|contracture|"
+    r"claquage|entorse|[ée]longation|[ée]lancement|boite|boiter|g[êe]ne|g[êe]n[ée])\w*"
+    # « mal » compte comme une plainte SAUF dans les tournures qui n'ont rien a
+    # voir avec la douleur : mal dormi, mal mange, mal place, mal execute.
+    r"|\bmal\b(?!\s*(?:dormi|dormir|mang|r[ée]veil|compris|plac|ex[ée]cut|fait|"
+    r"couru|parti|g[ée]r[ée]|estim[ée]|calibr))", re.IGNORECASE)
 
 def semaine_du_bloc(bloc_txt):
     """« Bloc 2 · S7 » -> 7. Renvoie None si illisible."""
@@ -318,8 +334,7 @@ def semaine_du_bloc(bloc_txt):
 def raison_declencheur(row, rows=None, idx=None, manquee=False):
     """Renvoie la raison d'appeler le coach, ou None. Volontairement restrictif :
     Loys a demande une intervention sur les seances cles uniquement."""
-    ressentis = cell(row, COL_RESSENTIS).lower()
-    if any(m in ressentis for m in MOTS_ALERTE):
+    if ALERTE.search(cell(row, COL_RESSENTIS)):
         return "signal de douleur dans les ressentis"
     rpe = cell(row, COL_RPE).replace(",", ".")
     try:
@@ -461,14 +476,21 @@ async def propositions_task():
         statut     = cell(r, 4).lower()
         if statut != "en attente" or not (date_cible and nouvelle):
             continue
+        # Le statut n'est ecrit qu'APRES un envoi reussi : sinon une proposition
+        # refusee par Discord (message trop long, salon indisponible) resterait
+        # marquee « postée » sans que personne ne l'ait jamais vue.
+        contenu = (f"🧠 <@{COACH_ID}> Le coach propose d'adapter la séance "
+                   f"du **{date_cible}** pour <@{USER_ID}>.\n\n"
+                   f"**Nouvelle séance**\n{tableau_seance(nouvelle)}\n\n"
+                   f"**Pourquoi**\n> {(motif or 'non précisé')[:600]}\n\n"
+                   f"Tu valides ? 👇")
+        try:
+            await channel.send(content=contenu[:1990],
+                               view=PropositionView(i, date_cible, nouvelle))
+        except Exception as e:
+            print(f"⚠️ Enzo, envoi de la proposition ligne {i + 1} : {e}")
+            continue
         await asyncio.to_thread(statut_proposition, i, "postée")
-        await channel.send(
-            content=(f"🧠 <@{COACH_ID}> Le coach propose d'adapter la séance "
-                     f"du **{date_cible}** pour <@{USER_ID}>.\n\n"
-                     f"**Nouvelle séance**\n{tableau_seance(nouvelle)}\n\n"
-                     f"**Pourquoi**\n> {motif or 'non précisé'}\n\n"
-                     f"Tu valides ? 👇"),
-            view=PropositionView(i, date_cible, nouvelle))
 
 
 # ── TACHES QUOTIDIENNES ───────────────────────────────────────────────────────
@@ -482,7 +504,7 @@ async def envoyer_seance(channel, rappel=True):
         if not rappel:
             await channel.send("❌ Impossible de lire le planning pour l'instant.")
         return
-    today = date.today()
+    today = aujourdhui()
     idx = find_row(rows, today.isoformat())
     if idx is None:
         if not rappel:
@@ -526,7 +548,7 @@ async def relance_soir_task():
         rows = await asyncio.to_thread(get_rows)
     except Exception as e:
         print(f"⚠️ Enzo, relance du soir : {e}"); return
-    idx = find_row(rows, date.today().isoformat())
+    idx = find_row(rows, aujourdhui().isoformat())
     if idx is None:
         return
     row    = rows[idx]
@@ -553,7 +575,7 @@ _prochain_run = None      # fonction fournie par bot.py, pour annoncer l'heure
 async def commande_semaine(channel):
     """!seance semaine : recap de la semaine d'Enzo, une ligne par jour."""
     rows = await asyncio.to_thread(get_rows)
-    today = date.today()
+    today = aujourdhui()
     lundi = today - datetime.timedelta(days=today.weekday())
     lignes = []
     for i in range(7):
@@ -582,7 +604,7 @@ async def commande_claude(channel, auteur_id, demande):
         return
     try:
         rows = await asyncio.to_thread(get_rows)
-        idx = find_row(rows, date.today().isoformat())
+        idx = find_row(rows, aujourdhui().isoformat())
         contexte = contexte_recent(rows, idx if idx is not None else len(rows) - 1)
         qui = "Loys (le coach)" if auteur_id == COACH_ID else "Enzo"
         texte = (f"COACH ENZO. Demande libre de {qui} depuis le salon Discord d'Enzo :\n"
@@ -609,7 +631,7 @@ async def commande_programme(channel, auteur_id, date_raw, seance):
         try:
             d = datetime.datetime.strptime(date_raw.strip(), fmt).date()
             if fmt == "%d/%m":
-                d = d.replace(year=date.today().year)
+                d = d.replace(year=aujourdhui().year)
             d_iso = d.isoformat()
             break
         except ValueError:
