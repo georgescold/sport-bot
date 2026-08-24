@@ -94,21 +94,47 @@ def est_course(type_seance):
 
 
 # ── MISE EN FORME DU MESSAGE ──────────────────────────────────────────────────
-def bloc_exercices(seance, limite=1400):
-    """La seance est stockee sur une ligne, exercices separes par des points
-    mediants. On la remet en liste a puces, bien plus lisible sur Discord."""
-    seance = seance.strip()
+# La seance est stockee en colonne D sous la forme :
+#   "Haut A : Développé couché|4x10|3-4|2min · Tirage vertical|4x10|3-4|2min · ..."
+# soit un titre, puis des exercices separes par « · », chacun portant ses quatre
+# champs separes par « | ». On la rend sous forme de tableau aligne dans un bloc
+# de code Discord : c'est la seule mise en forme a chasse fixe disponible, et
+# c'est ce qui se lit le mieux telephone en main pendant la seance.
+LARGEURS = (22, 11, 4, 6)          # exercice, series, RPE, recup : 49 colonnes
+
+def _tronque(txt, n):
+    txt = txt.strip()
+    return txt if len(txt) <= n else txt[:n - 1] + "."
+
+def tableau_seance(seance: str) -> str:
+    seance = (seance or "").strip()
     if not seance:
         return ""
     titre, _, reste = seance.partition(" : ")
+    exos = [e.strip() for e in reste.split(" · ") if e.strip()] if reste else []
+    # Seance libre (course, texte du coach non structure) : pas de tableau.
+    if not exos or not any("|" in e for e in exos):
+        return f"> **{seance}**"
+
+    le, ls, lr, lc = LARGEURS
+    lignes = [f"{'EXERCICE':<{le}}  {'SÉRIES':<{ls}}  {'RPE':<{lr}}  {'RÉC.':<{lc}}",
+              "─" * (le + ls + lr + lc + 6)]
+    for e in exos:
+        ch = [c.strip() for c in e.split("|")]
+        ch += [""] * (4 - len(ch))
+        lignes.append(f"{_tronque(ch[0], le):<{le}}  {_tronque(ch[1], ls):<{ls}}  "
+                      f"{_tronque(ch[2], lr):<{lr}}  {_tronque(ch[3], lc):<{lc}}".rstrip())
+    corps = "\n".join(lignes)
+    return f"**{titre}**\n```\n{corps}\n```"
+
+
+def resume_seance(seance: str, limite: int = 90) -> str:
+    """Version courte, une ligne, pour les messages qui ne sont pas la seance."""
+    titre, _, reste = (seance or "").partition(" : ")
     if not reste:
-        return f"> **{seance[:limite]}**"
-    lignes = [f"> **{titre}**"]
-    for ex in reste.split(" · "):
-        ex = ex.strip()
-        if ex:
-            lignes.append(f"> • {ex}")
-    txt = "\n".join(lignes)
+        return (seance or "")[:limite]
+    noms = [e.split("|")[0].strip() for e in reste.split(" · ") if e.strip()]
+    txt = f"{titre} : " + ", ".join(noms)
     return txt[:limite] + ("..." if len(txt) > limite else "")
 
 
@@ -190,10 +216,92 @@ class SeanceView(ui.View):
                 "❌ Aucune séance trouvée pour aujourd'hui dans le planning.", ephemeral=True)
             return
         seance = cell(rows[idx], COL_SEANCE)
-        await asyncio.to_thread(write_cell, idx, COL_SEANCE, f"{seance} - ❌ Non réalisée")
+        report = await reporter_seance(idx, rows)
+        marque = f"{seance} - ❌ Non réalisée"
+        if report:
+            marque += f", reportée au {report}"
+        await asyncio.to_thread(write_cell, idx, COL_SEANCE, marque)
+        if report:
+            jour_fr = JOURS_FR[date.fromisoformat(report).strftime("%A")]
+            suite = (f"Je l'ai reportée à **{jour_fr} {date.fromisoformat(report).strftime('%d/%m')}**, "
+                     f"qui était un jour de repos. Ta semaine reste complète.")
+        else:
+            suite = ("Plus de jour de repos disponible cette semaine, je ne la reporte pas : "
+                     "mieux vaut une séance en moins que deux le même jour.")
         await interaction.response.edit_message(
-            content=(f"<@{USER_ID}> C'est noté, pas de souci. On repart demain ! 💪"),
+            content=f"<@{USER_ID}> C'est noté, pas de souci. 💪\n{suite}",
             view=None)
+        await verifier_declencheur_coach(idx, interaction.channel, manquee=True)
+
+
+# ── SEANCE MANQUEE : REPORT INTELLIGENT ───────────────────────────────────────
+# Choix assume : on ne decale PAS tout le programme d'un jour. Cela deplacerait
+# les sorties de course, casserait l'alternance haut / bas et ferait deraper les
+# 12 semaines. On reporte la seance manquee sur le prochain jour de REPOS de la
+# meme semaine, ce qui preserve le volume hebdomadaire et la structure du bloc.
+# Si la semaine n'a plus de jour de repos disponible, la seance est perdue : on
+# le dit franchement plutot que d'entasser deux seances sur un meme jour.
+
+def _lundi(d_iso):
+    d = date.fromisoformat(d_iso)
+    return d - datetime.timedelta(days=d.weekday())
+
+def chercher_report(rows, idx):
+    """Renvoie l'index de la ligne d'accueil, ou None. On ne reporte que sur un
+    jour de repos a venir, dans la meme semaine, et jamais sur un jour de course."""
+    try:
+        origine = _lundi(cell(rows[idx], COL_DATE))
+    except ValueError:
+        return None
+    aujourdhui = date.today()
+    for i in range(idx + 1, len(rows)):
+        r = rows[i]
+        d_txt = cell(r, COL_DATE)
+        if not d_txt:
+            continue
+        try:
+            d = date.fromisoformat(d_txt)
+        except ValueError:
+            continue
+        if _lundi(d_txt) != origine:      # on ne deborde pas sur la semaine suivante
+            return None
+        if d <= aujourdhui:
+            continue
+        if est_repos(cell(r, COL_SEANCE)) and cell(r, COL_TYPE).lower() == "repos":
+            return i
+    return None
+
+async def reporter_seance(idx, rows=None):
+    """Deplace la seance manquee. Renvoie la date d'accueil, ou None."""
+    if rows is None:
+        rows = await asyncio.to_thread(get_rows)
+    seance = cell(rows[idx], COL_SEANCE)
+    cible = chercher_report(rows, idx)
+    if cible is None:
+        return None
+    await asyncio.to_thread(write_cell, cible, COL_SEANCE, seance)
+    await asyncio.to_thread(write_cell, cible, COL_TYPE, cell(rows[idx], COL_TYPE))
+    return cell(rows[cible], COL_DATE)
+
+def seances_manquees_recentes(rows, idx, fenetre=7):
+    """Nombre de seances marquees non realisees sur les derniers jours."""
+    try:
+        fin = date.fromisoformat(cell(rows[idx], COL_DATE))
+    except ValueError:
+        return 0
+    debut = fin - datetime.timedelta(days=fenetre)
+    n = 0
+    for r in rows[1:]:
+        d_txt = cell(r, COL_DATE)
+        if not d_txt:
+            continue
+        try:
+            d = date.fromisoformat(d_txt)
+        except ValueError:
+            continue
+        if debut <= d <= fin and "Non réalisée" in cell(r, COL_SEANCE):
+            n += 1
+    return n
 
 
 # ── COACH : DEPOT D'UNE DEMANDE POUR LA ROUTINE CLOUD ─────────────────────────
@@ -207,7 +315,7 @@ def semaine_du_bloc(bloc_txt):
             return int(morceau[1:])
     return None
 
-def raison_declencheur(row):
+def raison_declencheur(row, rows=None, idx=None, manquee=False):
     """Renvoie la raison d'appeler le coach, ou None. Volontairement restrictif :
     Loys a demande une intervention sur les seances cles uniquement."""
     ressentis = cell(row, COL_RESSENTIS).lower()
@@ -222,6 +330,10 @@ def raison_declencheur(row):
     semaine = semaine_du_bloc(cell(row, COL_BLOC))
     if semaine in (4, 8, 12) and cell(row, COL_JOUR).lower() == "dimanche":
         return f"fin du bloc (semaine {semaine})"
+    if manquee and rows is not None and idx is not None:
+        n = seances_manquees_recentes(rows, idx)
+        if n >= 2:
+            return f"{n} séances manquées en 7 jours"
     return None
 
 def contexte_recent(rows, idx, nb=14):
@@ -248,13 +360,13 @@ def deposer_demande(texte):
         body={"values": [[datetime.datetime.now(PARIS).strftime("%Y-%m-%d %H:%M"),
                           texte, "pending", "", ""]]}).execute()
 
-async def verifier_declencheur_coach(row_idx, channel):
+async def verifier_declencheur_coach(row_idx, channel, manquee=False):
     """Appele apres chaque saisie. Depose une demande d'analyse si la seance le
     justifie. La routine cloud repondra au prochain passage."""
     try:
         rows = await asyncio.to_thread(get_rows)
         row = rows[row_idx]
-        raison = raison_declencheur(row)
+        raison = raison_declencheur(row, rows, row_idx, manquee)
         if not raison:
             return
         demande = (
@@ -353,7 +465,7 @@ async def propositions_task():
         await channel.send(
             content=(f"🧠 <@{COACH_ID}> Le coach propose d'adapter la séance "
                      f"du **{date_cible}** pour <@{USER_ID}>.\n\n"
-                     f"**Nouvelle séance**\n{bloc_exercices(nouvelle)}\n\n"
+                     f"**Nouvelle séance**\n{tableau_seance(nouvelle)}\n\n"
                      f"**Pourquoi**\n> {motif or 'non précisé'}\n\n"
                      f"Tu valides ? 👇"),
             view=PropositionView(i, date_cible, nouvelle))
@@ -387,7 +499,7 @@ async def rappel_matin_task():
     await channel.send(
         content=(f"💪 Hey <@{USER_ID}> ! Ta séance du jour 👇\n\n"
                  f"**📅 {jour} {date_fr}**  ·  _{bloc}_\n"
-                 f"{bloc_exercices(seance)}\n\n"
+                 f"{tableau_seance(seance)}\n\n"
                  f"Clique sur un bouton une fois la séance terminée."),
         view=SeanceView())
 
@@ -412,7 +524,7 @@ async def relance_soir_task():
         return                       # deja renseignee
     await channel.send(
         content=(f"⏰ <@{USER_ID}> Tu n'as pas encore renseigné ta séance du jour ! 👀\n"
-                 f"{bloc_exercices(seance)}\n\n"
+                 f"{tableau_seance(seance)}\n\n"
                  f"Deux minutes et c'est réglé 👇"),
         view=SeanceView())
 
