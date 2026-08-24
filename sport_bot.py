@@ -239,10 +239,13 @@ def send_message(content: str) -> dict:
     return resp.json()
 
 
-def send_payload(payload: dict) -> dict:
-    """Envoie un payload Discord complet (avec composants/boutons)."""
+def send_payload(payload: dict, channel_id: str = None) -> dict:
+    """Envoie un payload Discord complet (avec composants/boutons).
+
+    channel_id permet de viser un autre salon que celui de Loys, par exemple
+    celui d'Enzo, dont le suivi vit dans enzo.py et dans un autre classeur."""
     resp = requests.post(
-        f"{DISCORD_API}/channels/{CHANNEL_ID}/messages",
+        f"{DISCORD_API}/channels/{channel_id or CHANNEL_ID}/messages",
         headers=discord_headers(),
         json=payload
     )

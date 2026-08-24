@@ -1,0 +1,453 @@
+"""
+enzo.py - Suivi de l'athlete Enzo (musculation debutant), branche sur bot.py.
+
+Volontairement SEPARE de bot.py : le planning d'Enzo vit dans un autre classeur,
+n'a pas les memes colonnes que celui de Loys, et un clic sur un de ses boutons ne
+doit jamais pouvoir ecrire dans la feuille de Loys. Tous les custom_id sont donc
+prefixes "enzo_", et ce module n'importe PAS bot.py (pas d'import circulaire) :
+bot.py appelle simplement init(bot) au demarrage.
+
+  8h00 quotidien   -> seance du jour dans #sport-enzo + boutons de validation
+  21h05 quotidien  -> relance si la seance n'est pas renseignee
+  toutes les 20 min -> propositions du coach en attente de validation par Loys
+
+Le coach IA ne passe PAS par l'API Anthropic : le bot depose une demande dans
+l'onglet « Commandes » du classeur d'Enzo, et la routine cloud claude.ai la
+traite au prochain passage (elle tourne sous l'abonnement de Loys).
+"""
+
+import os, json, asyncio, datetime
+from datetime import date
+from zoneinfo import ZoneInfo
+
+import discord
+from discord.ext import tasks
+from discord import ui
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+
+# ── CONFIGURATION ─────────────────────────────────────────────────────────────
+CHANNEL_ID     = int(os.environ.get("ENZO_CHANNEL_ID", "1541366095917879347"))
+USER_ID        = int(os.environ.get("ENZO_USER_ID", "200307038947901441"))
+SPREADSHEET_ID = os.environ.get("ENZO_SPREADSHEET_ID",
+                                "14Ec9DwKGXpULMeHRmn4AE5LILYG4bzEd5AaN6e7bDyo")
+SHEET          = "Données Enzo"
+CMD_SHEET      = "Commandes"
+PROP_SHEET     = "Propositions"
+SA_JSON        = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
+
+# Loys est le coach : lui seul valide les adaptations proposees.
+COACH_ID = int(os.environ.get("DISCORD_USER_ID", "0"))
+
+PARIS = ZoneInfo("Europe/Paris")
+
+# Colonnes de « Données Enzo » (0-based). Differentes de celles de Loys.
+COL_DATE, COL_JOUR, COL_MOIS   = 0, 1, 2
+COL_SEANCE, COL_DOUBLE         = 3, 4
+COL_TYPE, COL_RESSENTIS        = 5, 6
+COL_KM                         = 7
+COL_BLOC                       = 12
+COL_CHARGES, COL_RPE, COL_COACH = 13, 14, 15
+
+JOURS_FR = {"Monday":"Lundi","Tuesday":"Mardi","Wednesday":"Mercredi","Thursday":"Jeudi",
+            "Friday":"Vendredi","Saturday":"Samedi","Sunday":"Dimanche"}
+
+_bot = None          # instance discord.ext.commands.Bot, fournie par bot.py
+
+
+# ── ACCES AU CLASSEUR ─────────────────────────────────────────────────────────
+def _svc():
+    creds = service_account.Credentials.from_service_account_info(
+        json.loads(SA_JSON), scopes=["https://www.googleapis.com/auth/spreadsheets"])
+    return build("sheets", "v4", credentials=creds).spreadsheets()
+
+def get_rows():
+    return _svc().values().get(
+        spreadsheetId=SPREADSHEET_ID, range=f"'{SHEET}'!A:P").execute().get("values", [])
+
+def write_cell(row, col, val, parse=False):
+    """Ecrit une cellule. parse=True -> USER_ENTERED (nombres et dates reels).
+
+    Le classeur est en locale en_US : le separateur decimal est le POINT. En
+    fr_FR, « 3.5 » serait stocke comme la date du 3 mai et fausserait tous les
+    agregats de kilometres. Ne jamais rebasculer ce classeur en fr_FR."""
+    _svc().values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"'{SHEET}'!{chr(65 + col)}{row + 1}",
+        valueInputOption="USER_ENTERED" if parse else "RAW",
+        body={"values": [[val]]}).execute()
+
+def find_row(rows, d_iso):
+    for i, r in enumerate(rows):
+        if r and r[0].strip() == d_iso:
+            return i
+    return None
+
+def cell(row, col):
+    return row[col].strip() if len(row) > col else ""
+
+def est_repos(seance):
+    return (not seance.strip()) or seance.strip().lower().startswith("repos")
+
+def est_course(type_seance):
+    return type_seance.strip().lower() in ("footing", "course")
+
+
+# ── MISE EN FORME DU MESSAGE ──────────────────────────────────────────────────
+def bloc_exercices(seance, limite=1400):
+    """La seance est stockee sur une ligne, exercices separes par des points
+    mediants. On la remet en liste a puces, bien plus lisible sur Discord."""
+    seance = seance.strip()
+    if not seance:
+        return ""
+    titre, _, reste = seance.partition(" : ")
+    if not reste:
+        return f"> **{seance[:limite]}**"
+    lignes = [f"> **{titre}**"]
+    for ex in reste.split(" · "):
+        ex = ex.strip()
+        if ex:
+            lignes.append(f"> • {ex}")
+    txt = "\n".join(lignes)
+    return txt[:limite] + ("..." if len(txt) > limite else "")
+
+
+# ── SAISIE DE LA SEANCE ───────────────────────────────────────────────────────
+class MuscuModal(ui.Modal, title="💪 Ta séance de muscu"):
+    charges = ui.TextInput(label="Charges utilisées",
+        placeholder="Ex: DC 25 kg, tirage 30 kg, curl 12 kg", max_length=200)
+    rpe = ui.TextInput(label="RPE ressenti (1 à 5)",
+        placeholder="4", max_length=3)
+    ressentis = ui.TextInput(label="Ressentis, douleurs, remarques",
+        style=discord.TextStyle.paragraph,
+        placeholder="Ex: bonne séance, gêne au genou sur les fentes", max_length=500)
+
+    def __init__(self, row_idx):
+        super().__init__()
+        self.row_idx = row_idx
+
+    async def on_submit(self, interaction: discord.Interaction):
+        c, r, s = str(self.charges).strip(), str(self.rpe).strip(), str(self.ressentis).strip()
+        await asyncio.to_thread(write_cell, self.row_idx, COL_CHARGES, c)
+        await asyncio.to_thread(write_cell, self.row_idx, COL_RPE, r.replace(",", "."), True)
+        await asyncio.to_thread(write_cell, self.row_idx, COL_RESSENTIS, s)
+        await interaction.response.edit_message(
+            content=(f"✅ <@{USER_ID}> C'est enregistré, bravo pour la séance ! 🔥\n"
+                     f"**Charges :** {c}\n**RPE :** {r}/5\n**Ressentis :** {s}"),
+            view=None)
+        await verifier_declencheur_coach(self.row_idx, interaction.channel)
+
+
+class CourseModal(ui.Modal, title="🏃 Ta sortie du jour"):
+    km = ui.TextInput(label="Kilomètres parcourus", placeholder="Ex: 2.4", max_length=10)
+    rpe = ui.TextInput(label="RPE ressenti (1 à 5)", placeholder="3", max_length=3)
+    ressentis = ui.TextInput(label="Ressentis, douleurs, remarques",
+        style=discord.TextStyle.paragraph, max_length=500)
+
+    def __init__(self, row_idx):
+        super().__init__()
+        self.row_idx = row_idx
+
+    async def on_submit(self, interaction: discord.Interaction):
+        k = str(self.km).strip().replace(",", ".")
+        r, s = str(self.rpe).strip(), str(self.ressentis).strip()
+        await asyncio.to_thread(write_cell, self.row_idx, COL_KM, k, True)
+        await asyncio.to_thread(write_cell, self.row_idx, COL_RPE, r.replace(",", "."), True)
+        await asyncio.to_thread(write_cell, self.row_idx, COL_RESSENTIS, s)
+        await interaction.response.edit_message(
+            content=(f"✅ <@{USER_ID}> Sortie enregistrée ! 🏃\n"
+                     f"**Distance :** {k} km\n**RPE :** {r}/5\n**Ressentis :** {s}"),
+            view=None)
+        await verifier_declencheur_coach(self.row_idx, interaction.channel)
+
+
+class SeanceView(ui.View):
+    """Vue persistante d'Enzo. custom_id prefixes pour ne jamais croiser ceux de Loys."""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def _ligne_du_jour(self):
+        rows = await asyncio.to_thread(get_rows)
+        return rows, find_row(rows, date.today().isoformat())
+
+    @ui.button(label="✅ Séance faite", style=discord.ButtonStyle.success,
+               custom_id="enzo_valider")
+    async def valider(self, interaction: discord.Interaction, button: ui.Button):
+        rows, idx = await self._ligne_du_jour()
+        if idx is None:
+            await interaction.response.send_message(
+                "❌ Aucune séance trouvée pour aujourd'hui dans le planning.", ephemeral=True)
+            return
+        modale = CourseModal(idx) if est_course(cell(rows[idx], COL_TYPE)) else MuscuModal(idx)
+        await interaction.response.send_modal(modale)
+
+    @ui.button(label="❌ Non réalisée", style=discord.ButtonStyle.danger,
+               custom_id="enzo_non_realise")
+    async def non_realise(self, interaction: discord.Interaction, button: ui.Button):
+        rows, idx = await self._ligne_du_jour()
+        if idx is None:
+            await interaction.response.send_message(
+                "❌ Aucune séance trouvée pour aujourd'hui dans le planning.", ephemeral=True)
+            return
+        seance = cell(rows[idx], COL_SEANCE)
+        await asyncio.to_thread(write_cell, idx, COL_SEANCE, f"{seance} - ❌ Non réalisée")
+        await interaction.response.edit_message(
+            content=(f"<@{USER_ID}> C'est noté, pas de souci. On repart demain ! 💪"),
+            view=None)
+
+
+# ── COACH : DEPOT D'UNE DEMANDE POUR LA ROUTINE CLOUD ─────────────────────────
+MOTS_ALERTE = ("douleur", "mal ", "blessure", "genou", "dos", "épaule", "epaule",
+               "tendon", "gêne", "gene ", "boiter")
+
+def semaine_du_bloc(bloc_txt):
+    """« Bloc 2 · S7 » -> 7. Renvoie None si illisible."""
+    for morceau in bloc_txt.replace("·", " ").split():
+        if morceau.upper().startswith("S") and morceau[1:].isdigit():
+            return int(morceau[1:])
+    return None
+
+def raison_declencheur(row):
+    """Renvoie la raison d'appeler le coach, ou None. Volontairement restrictif :
+    Loys a demande une intervention sur les seances cles uniquement."""
+    ressentis = cell(row, COL_RESSENTIS).lower()
+    if any(m in ressentis for m in MOTS_ALERTE):
+        return "signal de douleur dans les ressentis"
+    rpe = cell(row, COL_RPE).replace(",", ".")
+    try:
+        if float(rpe) >= 5:
+            return "RPE 5 atteint, séance menée jusqu'à l'échec"
+    except ValueError:
+        pass
+    semaine = semaine_du_bloc(cell(row, COL_BLOC))
+    if semaine in (4, 8, 12) and cell(row, COL_JOUR).lower() == "dimanche":
+        return f"fin du bloc (semaine {semaine})"
+    return None
+
+def contexte_recent(rows, idx, nb=14):
+    """Les dernieres lignes renseignees, pour que le coach ait de quoi juger."""
+    lignes = []
+    for r in rows[max(1, idx - nb):idx + 1]:
+        if not r or not cell(r, COL_DATE):
+            continue
+        if not (cell(r, COL_CHARGES) or cell(r, COL_KM) or cell(r, COL_RESSENTIS)):
+            continue
+        lignes.append(" | ".join([
+            cell(r, COL_DATE), cell(r, COL_BLOC), cell(r, COL_TYPE),
+            "seance: " + cell(r, COL_SEANCE)[:90],
+            "charges: " + (cell(r, COL_CHARGES) or "-"),
+            "km: " + (cell(r, COL_KM) or "-"),
+            "RPE: " + (cell(r, COL_RPE) or "-"),
+            "ressentis: " + (cell(r, COL_RESSENTIS) or "-")]))
+    return "\n".join(lignes)
+
+def deposer_demande(texte):
+    _svc().values().append(
+        spreadsheetId=SPREADSHEET_ID, range=f"'{CMD_SHEET}'!A:E",
+        valueInputOption="RAW", insertDataOption="INSERT_ROWS",
+        body={"values": [[datetime.datetime.now(PARIS).strftime("%Y-%m-%d %H:%M"),
+                          texte, "pending", "", ""]]}).execute()
+
+async def verifier_declencheur_coach(row_idx, channel):
+    """Appele apres chaque saisie. Depose une demande d'analyse si la seance le
+    justifie. La routine cloud repondra au prochain passage."""
+    try:
+        rows = await asyncio.to_thread(get_rows)
+        row = rows[row_idx]
+        raison = raison_declencheur(row)
+        if not raison:
+            return
+        demande = (
+            f"COACH ENZO. Motif : {raison}. Analyse la seance du {cell(row, COL_DATE)} "
+            f"et l'historique recent, puis poste un retour court et concret dans le salon "
+            f"Discord d'Enzo (id {CHANNEL_ID}), en mentionnant <@{USER_ID}>. "
+            f"Si une adaptation du planning te parait justifiee, NE MODIFIE PAS le planning : "
+            f"depose-la dans l'onglet « {PROP_SHEET} » du classeur d'Enzo, "
+            f"c'est Loys qui valide.\n\nHISTORIQUE :\n{contexte_recent(rows, row_idx)}")
+        await asyncio.to_thread(deposer_demande, demande)
+        await channel.send(
+            f"🧠 J'ai demandé une analyse au coach ({raison}). "
+            f"Sa réponse arrivera au prochain passage de la routine.")
+    except Exception as e:
+        print(f"⚠️ Enzo, declencheur coach : {e}")
+
+
+# ── PROPOSITIONS DU COACH, VALIDEES PAR LOYS ──────────────────────────────────
+def get_propositions():
+    try:
+        return _svc().values().get(
+            spreadsheetId=SPREADSHEET_ID, range=f"'{PROP_SHEET}'!A:E").execute().get("values", [])
+    except Exception:
+        return []
+
+def statut_proposition(idx, statut):
+    _svc().values().update(
+        spreadsheetId=SPREADSHEET_ID, range=f"'{PROP_SHEET}'!E{idx + 1}",
+        valueInputOption="RAW", body={"values": [[statut]]}).execute()
+
+
+class PropositionView(ui.View):
+    """Adaptation proposee par le coach. Seul Loys peut trancher."""
+    def __init__(self, idx=0, date_cible="", nouvelle=""):
+        super().__init__(timeout=None)
+        self.idx, self.date_cible, self.nouvelle = idx, date_cible, nouvelle
+        for enfant in self.children:
+            enfant.custom_id = f"{enfant.custom_id}_{idx}"
+
+    async def _reserve_au_coach(self, interaction):
+        if COACH_ID and interaction.user.id != COACH_ID:
+            await interaction.response.send_message(
+                "Seul le coach peut valider une adaptation du planning.", ephemeral=True)
+            return False
+        return True
+
+    @ui.button(label="✅ Appliquer", style=discord.ButtonStyle.success,
+               custom_id="enzo_prop_ok")
+    async def appliquer(self, interaction: discord.Interaction, button: ui.Button):
+        if not await self._reserve_au_coach(interaction):
+            return
+        rows = await asyncio.to_thread(get_rows)
+        cible = find_row(rows, self.date_cible)
+        if cible is None:
+            await interaction.response.send_message(
+                f"❌ Aucune ligne au {self.date_cible} dans le planning.", ephemeral=True)
+            return
+        await asyncio.to_thread(write_cell, cible, COL_SEANCE, self.nouvelle)
+        await asyncio.to_thread(statut_proposition, self.idx, "validée")
+        await interaction.response.edit_message(
+            content=(f"✅ Planning mis à jour pour le {self.date_cible} :\n"
+                     f"> **{self.nouvelle}**"),
+            view=None)
+
+    @ui.button(label="❌ Refuser", style=discord.ButtonStyle.secondary,
+               custom_id="enzo_prop_non")
+    async def refuser(self, interaction: discord.Interaction, button: ui.Button):
+        if not await self._reserve_au_coach(interaction):
+            return
+        await asyncio.to_thread(statut_proposition, self.idx, "refusée")
+        await interaction.response.edit_message(
+            content="❌ Proposition écartée, le planning reste inchangé.", view=None)
+
+
+@tasks.loop(minutes=20)
+async def propositions_task():
+    """Poste les propositions du coach restees « en attente » dans le Sheet."""
+    channel = _bot.get_channel(CHANNEL_ID) if _bot else None
+    if not channel:
+        return
+    try:
+        rows = await asyncio.to_thread(get_propositions)
+    except Exception as e:
+        print(f"⚠️ Enzo, lecture des propositions : {e}")
+        return
+    for i, r in enumerate(rows):
+        if i == 0 or not r:
+            continue
+        date_cible = cell(r, 0)
+        nouvelle   = cell(r, 1)
+        motif      = cell(r, 2)
+        statut     = cell(r, 4).lower()
+        if statut != "en attente" or not (date_cible and nouvelle):
+            continue
+        await asyncio.to_thread(statut_proposition, i, "postée")
+        await channel.send(
+            content=(f"🧠 <@{COACH_ID}> Le coach propose d'adapter la séance "
+                     f"du **{date_cible}** pour <@{USER_ID}>.\n\n"
+                     f"**Nouvelle séance**\n{bloc_exercices(nouvelle)}\n\n"
+                     f"**Pourquoi**\n> {motif or 'non précisé'}\n\n"
+                     f"Tu valides ? 👇"),
+            view=PropositionView(i, date_cible, nouvelle))
+
+
+# ── TACHES QUOTIDIENNES ───────────────────────────────────────────────────────
+@tasks.loop(time=datetime.time(hour=8, minute=0, tzinfo=PARIS))
+async def rappel_matin_task():
+    channel = _bot.get_channel(CHANNEL_ID) if _bot else None
+    if not channel:
+        return
+    try:
+        rows = await asyncio.to_thread(get_rows)
+    except Exception as e:
+        print(f"⚠️ Enzo, rappel matin : {e}"); return
+    today = date.today()
+    idx = find_row(rows, today.isoformat())
+    if idx is None:
+        return                      # hors periode de programme, on ne dit rien
+    row     = rows[idx]
+    seance  = cell(row, COL_SEANCE)
+    jour    = cell(row, COL_JOUR) or JOURS_FR[today.strftime("%A")]
+    date_fr = today.strftime("%d/%m/%Y")
+    bloc    = cell(row, COL_BLOC)
+
+    if est_repos(seance):
+        await channel.send(
+            f"😴 <@{USER_ID}> Aujourd'hui c'est repos ({jour} {date_fr}).\n"
+            f"La récupération fait partie du programme, profites-en. 🛋️")
+        return
+    await channel.send(
+        content=(f"💪 Hey <@{USER_ID}> ! Ta séance du jour 👇\n\n"
+                 f"**📅 {jour} {date_fr}**  ·  _{bloc}_\n"
+                 f"{bloc_exercices(seance)}\n\n"
+                 f"Clique sur un bouton une fois la séance terminée."),
+        view=SeanceView())
+
+
+@tasks.loop(time=datetime.time(hour=21, minute=5, tzinfo=PARIS))
+async def relance_soir_task():
+    channel = _bot.get_channel(CHANNEL_ID) if _bot else None
+    if not channel:
+        return
+    try:
+        rows = await asyncio.to_thread(get_rows)
+    except Exception as e:
+        print(f"⚠️ Enzo, relance du soir : {e}"); return
+    idx = find_row(rows, date.today().isoformat())
+    if idx is None:
+        return
+    row    = rows[idx]
+    seance = cell(row, COL_SEANCE)
+    if est_repos(seance) or "Non réalisée" in seance:
+        return
+    if cell(row, COL_CHARGES) or cell(row, COL_KM) or cell(row, COL_RESSENTIS):
+        return                       # deja renseignee
+    await channel.send(
+        content=(f"⏰ <@{USER_ID}> Tu n'as pas encore renseigné ta séance du jour ! 👀\n"
+                 f"{bloc_exercices(seance)}\n\n"
+                 f"Deux minutes et c'est réglé 👇"),
+        view=SeanceView())
+
+
+# ── DEMARRAGE, APPELE PAR bot.py ──────────────────────────────────────────────
+def reveiller_propositions():
+    """Les boutons d'une proposition portent un custom_id indexe sur sa ligne, donc
+    non reenregistrable au demarrage (discord.py 2.3). Une proposition deja postee
+    mais sans reponse aurait des boutons morts : on la repasse en attente pour
+    qu'elle soit repostee avec des boutons vivants."""
+    try:
+        for i, r in enumerate(get_propositions()):
+            if i and r and cell(r, 4).lower() == "postée":
+                statut_proposition(i, "en attente")
+    except Exception as e:
+        print(f"⚠️ Enzo, reveil des propositions : {e}")
+
+
+def init(bot_instance):
+    """Enregistre les vues persistantes et demarre les taches. Idempotent :
+    on_ready est rejoue a chaque reconnexion Gateway."""
+    global _bot
+    if _bot is None:
+        reveiller_propositions()
+    _bot = bot_instance
+    bot_instance.add_view(SeanceView())
+    if not rappel_matin_task.is_running():  rappel_matin_task.start()
+    if not relance_soir_task.is_running():  relance_soir_task.start()
+    if not propositions_task.is_running():  propositions_task.start()
+    print(f"✅ Suivi d'Enzo actif (salon {CHANNEL_ID})")
+
+
+@rappel_matin_task.before_loop
+@relance_soir_task.before_loop
+@propositions_task.before_loop
+async def _attendre_bot():
+    if _bot:
+        await _bot.wait_until_ready()

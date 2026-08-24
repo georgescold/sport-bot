@@ -12,6 +12,9 @@ bot.py - Bot Discord "Road to sub 38"
   21h05 quotidien          → rappel si séance non renseignée (ou msg neutre si vide)
   21h00 dimanche           → résumé hebdomadaire + graphique Strava-like
 
+Le suivi du second athlète (Enzo, musculation) vit dans enzo.py : autre classeur,
+autres colonnes, custom_id préfixés, aucun croisement possible avec cette feuille.
+
 La note du coach (colonne « Notes Nico ») accompagne la séance partout où celle-ci
 est affichée, plutôt que dans un message séparé.
 """
@@ -25,6 +28,12 @@ from discord.ext import commands, tasks
 from discord import ui
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+
+try:
+    import enzo                      # suivi du second athlete, module independant
+except Exception as _e:              # pragma: no cover
+    enzo = None
+    print(f"⚠️ Module enzo indisponible : {_e}")
 
 import matplotlib
 matplotlib.use("Agg")
@@ -606,6 +615,11 @@ async def on_ready():
     if not seance_watch_task.is_running(): seance_watch_task.start()
     bot.add_view(SeanceView())
     bot.add_view(ReposView())
+    if enzo:
+        try:
+            enzo.init(bot)
+        except Exception as e:
+            print(f"⚠️ Demarrage du suivi d'Enzo : {e}")
     # Les slash commands ont été retirées (tout passe par !seance / !programme /
     # !claude) : on synchronise un arbre vide pour les désenregistrer de Discord.
     if not _tree_synced:
