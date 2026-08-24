@@ -105,13 +105,16 @@ def est_course(type_seance):
 # champs separes par « | ». On la rend sous forme de tableau aligne dans un bloc
 # de code Discord : c'est la seule mise en forme a chasse fixe disponible, et
 # c'est ce qui se lit le mieux telephone en main pendant la seance.
-LARGEURS = (22, 11, 4, 6)          # exercice, series, RPE, recup : 49 colonnes
+# Discord sur telephone ne fait PAS defiler les blocs de code : il les renvoie a
+# la ligne, ce qui disloque un tableau en colonnes. Un vrai tableau aligne tient
+# en 49 caracteres, or l'ecran d'un telephone en affiche une trentaine. On passe
+# donc a deux lignes par exercice : le nom, puis ses chiffres en dessous. Rien ne
+# depasse ~30 caracteres, donc rien ne se replie, et la lecture reste verticale.
+LARGEUR_MAX = 30
 
-def _tronque(txt, n):
-    # Les accents graves fermeraient le bloc de code Discord et disloqueraient
-    # tout le message : ils sont neutralises avant tout affichage.
-    txt = txt.strip().replace("`", "'")
-    return txt if len(txt) <= n else txt[:n - 1] + "."
+def _propre(txt):
+    # Un accent grave fermerait le bloc de code et disloquerait tout le message.
+    return txt.strip().replace("`", "'")
 
 def tableau_seance(seance: str) -> str:
     seance = (seance or "").strip()
@@ -119,18 +122,17 @@ def tableau_seance(seance: str) -> str:
         return ""
     titre, _, reste = seance.partition(" : ")
     exos = [e.strip() for e in reste.split(" · ") if e.strip()] if reste else []
-    # Seance libre (course, texte du coach non structure) : pas de tableau.
     if not exos or not any("|" in e for e in exos):
-        return f"> **{seance.replace('`', chr(39))}**"
+        return f"> **{_propre(seance)}**"
 
-    le, ls, lr, lc = LARGEURS
-    lignes = [f"{'EXERCICE':<{le}}  {'SÉRIES':<{ls}}  {'RPE':<{lr}}  {'RÉC.':<{lc}}",
-              "─" * (le + ls + lr + lc + 6)]
-    for e in exos:
-        ch = [c.strip() for c in e.split("|")]
+    lignes = []
+    for i, e in enumerate(exos, 1):
+        ch = [_propre(c) for c in e.split("|")]
         ch += [""] * (4 - len(ch))
-        lignes.append(f"{_tronque(ch[0], le):<{le}}  {_tronque(ch[1], ls):<{ls}}  "
-                      f"{_tronque(ch[2], lr):<{lr}}  {_tronque(ch[3], lc):<{lc}}".rstrip())
+        nom, series, rpe, recup = ch[0], ch[1], ch[2], ch[3]
+        details = [d for d in (series, f"RPE {rpe}" if rpe else "", recup) if d]
+        lignes.append(f"{i}. {nom}")
+        lignes.append("   " + "  ".join(details))
     corps = "\n".join(lignes)
     return f"**{titre}**\n```\n{corps}\n```"
 
