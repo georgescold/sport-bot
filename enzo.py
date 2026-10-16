@@ -39,6 +39,12 @@ SA_JSON        = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 # Loys est le coach : lui seul valide les adaptations proposees.
 COACH_ID = int(os.environ.get("DISCORD_USER_ID", "0"))
 
+# Routine d'Enzo en pause (demande de Loys le 16/10/2026) : plus aucun message
+# automatique dans son salon (seance de 8h00, relance de 21h05, propositions du
+# coach). Les commandes (!seance, !programme, !claude) et les boutons deja postes
+# restent utilisables. Repasser a False pour relancer.
+EN_PAUSE = True
+
 PARIS = ZoneInfo("Europe/Paris")
 
 def aujourdhui():
@@ -670,10 +676,13 @@ def init(bot_instance, prochain_run=None):
     on_ready est rejoue a chaque reconnexion Gateway."""
     global _bot, _prochain_run
     _prochain_run = prochain_run or _prochain_run
-    if _bot is None:
+    if _bot is None and not EN_PAUSE:
         reveiller_propositions()
     _bot = bot_instance
     bot_instance.add_view(SeanceView())
+    if EN_PAUSE:
+        print(f"⏸️ Suivi d'Enzo en pause : aucun message automatique (salon {CHANNEL_ID})")
+        return
     if not rappel_matin_task.is_running():  rappel_matin_task.start()
     if not relance_soir_task.is_running():  relance_soir_task.start()
     if not propositions_task.is_running():  propositions_task.start()
