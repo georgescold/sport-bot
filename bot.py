@@ -9,8 +9,11 @@ bot.py - Bot Discord "Road to sub 38"
   8h00 quotidien           → séance du jour + note du coach + boutons de validation
                              (jour de repos → propose une séance à saisir :
                               muscu ou course à pied)
-  toutes les 30 min        → prévient si le coach modifie la journée après 8h00
-  21h05 quotidien          → rappel si séance non renseignée (ou msg neutre si vide)
+  toutes les 30 min        → prévient si le coach modifie la journée après 8h00 (jusqu'à minuit)
+  21h05 quotidien          → dernier rappel si séance non renseignée (ou msg neutre
+                             avec boutons si repos) ; la journée reste ouverte
+  minuit (Paris)           → la journée ferme : les boutons de ses messages ne
+                             répondent plus, cf. journee_close()
   21h00 dimanche           → résumé hebdomadaire + graphique Strava-like
 
 Le suivi du second athlète (Enzo, musculation) vit dans enzo.py : autre classeur,
@@ -49,6 +52,12 @@ SHEET_NAME         = "Données Loys"  # NE JAMAIS écrire dans "Données Nico"
 SA_JSON            = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 
 PARIS = ZoneInfo("Europe/Paris")
+
+def aujourdhui() -> date:
+    """Le jour vécu à Paris, pas celui du serveur. Railway tourne en UTC : entre
+    minuit et 2h du matin, date.today() renverrait encore la veille, et la journée
+    ne fermerait pas à minuit."""
+    return datetime.datetime.now(PARIS).date()
 
 # Disposition « Données Loys » : A=date B=jour C=séance … F=ressentis
 # G="Notes Nico" (colonne du COACH : NE JAMAIS écrire) H=km_journee I=km_semaine
@@ -256,7 +265,7 @@ def bloc_note(note: str, limite: int = 900) -> str:
 
 
 def parse_date(text):
-    text = text.strip().lower(); y = date.today().year
+    text = text.strip().lower(); y = aujourdhui().year
     m = re.match(r"(\d{4})-(\d{2})-(\d{2})", text)
     if m: return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
     m = re.match(r"(\d{1,2})/(\d{1,2})(?:/(\d{4}))?", text)
@@ -286,7 +295,7 @@ WEEKS_WINDOW = 13   # ~3 mois affichés (1 trimestre), 1 point = 1 semaine (vue 
 def get_weekly_data():
     rows  = get_rows()
     kmc   = km_jour_col(rows)
-    today = date.today()
+    today = aujourdhui()
     week_start = today - datetime.timedelta(days=today.weekday())   # lundi de la semaine en cours
     week_end   = week_start + datetime.timedelta(days=6)
 
@@ -398,7 +407,7 @@ _annonce: dict = {}
 def set_annonce(seance: str, note: str = "", d: str = None):
     """Mémorise l'état annoncé. À appeler APRÈS chaque écriture du bot en col C,
     sinon la surveillance prendrait le bot lui-même pour le coach."""
-    _annonce.update({"date":   d or date.today().isoformat(),
+    _annonce.update({"date":   d or aujourdhui().isoformat(),
                      "seance": (seance or "").strip(),
                      "note":   (note or "").strip()})
 
@@ -408,11 +417,38 @@ def est_repos(seance: str) -> bool:
     return (not (seance or "").strip()) or seance_type(seance) == "Repos"
 
 
-async def programmer_seance_repos(interaction: discord.Interaction,
+# ── LA JOURNÉE FERME À MINUIT ────────────────────────────────────────────────
+# Les boutons sont persistants et cherchent « la ligne du jour » au moment du
+# clic : sans garde, un bouton de la veille cliqué après minuit écrirait dans la
+# journée suivante. Un message appartient au jour (Paris) où il a été posté ;
+# passé minuit, ses boutons ferment la journée au lieu d'écrire. Le rappel de
+# 21h05 n'est qu'un dernier rappel : jusqu'à minuit, tout reste cliquable.
+def jour_du_message(interaction: discord.Interaction) -> date:
+    msg = interaction.message
+    return msg.created_at.astimezone(PARIS).date() if msg else aujourdhui()
+
+
+def journee_close(interaction: discord.Interaction) -> bool:
+    return jour_du_message(interaction) != aujourdhui()
+
+
+async def fermer_journee(interaction: discord.Interaction):
+    """Retire les boutons d'un message d'une journée terminée et explique quoi faire."""
+    jour = jour_du_message(interaction)
+    fin  = (f"\n\n🔒 Journée du {jour.strftime('%d/%m')} close à minuit. "
+            f"Pour la compléter quand même : `!claude` + ce que tu as fait.")
+    contenu = interaction.message.content or ""
+    await interaction.response.edit_message(
+        content=contenu[:2000 - len(fin)] + fin, view=None)
+
+
+async def programmer_seance_repos(interaction: discord.Interaction, jour: date,
                                   texte: str, typ: str, emoji: str):
     """Jour de repos : écrit dans la ligne du jour la séance que Loys s'est
-    programmée (col C + type en col E), puis affiche les boutons de validation."""
-    today_str = date.today().isoformat()
+    programmée (col C + type en col E), puis affiche les boutons de validation.
+    `jour` est figé à l'ouverture de la modale : validée à 00h01, elle écrit
+    quand même dans la bonne journée."""
+    today_str = jour.isoformat()
     rows      = await asyncio.to_thread(get_rows)
     row_idx   = find_row(rows, today_str)
     if row_idx is None:
@@ -426,11 +462,11 @@ async def programmer_seance_repos(interaction: discord.Interaction,
     await asyncio.to_thread(write_cell, row_idx, COL_SEANCE, texte)
     await asyncio.to_thread(write_cell, row_idx, COL_TYPE, typ)
     invalidate_seance_cache()
-    set_annonce(texte, _annonce.get("note", ""))
-    jour = JOURS_FR[date.today().strftime("%A")]
+    if jour == aujourdhui():
+        set_annonce(texte, _annonce.get("note", ""))
     await interaction.response.edit_message(
         content=(f"{emoji} <@{DISCORD_USER_ID}> C'est noté dans le planning !\n\n"
-                 f"**📅 Séance : {jour} {date.today().strftime('%d/%m/%Y')}**\n"
+                 f"**📅 Séance : {JOURS_FR[jour.strftime('%A')]} {jour.strftime('%d/%m/%Y')}**\n"
                  f"> **{texte}**\n\n"
                  f"Clique sur un bouton une fois la séance terminée 👇"),
         view=SeanceView())
@@ -443,9 +479,13 @@ class MuscuModal(ui.Modal, title="💪 Ta séance de muscu"):
         placeholder="Ex: Pompes 3x15, DC barre 4x10 (récup 3'), tractions 4x8, gainage 3x1'",
         min_length=3, max_length=1000)
 
+    def __init__(self, jour: date):
+        super().__init__()
+        self.jour = jour
+
     async def on_submit(self, interaction: discord.Interaction):
         await programmer_seance_repos(
-            interaction, f"renfo muscu : {str(self.contenu).strip()}", "Renfo", "💪")
+            interaction, self.jour, f"renfo muscu : {str(self.contenu).strip()}", "Renfo", "💪")
 
 
 class CourseModal(ui.Modal, title="🏃 Ta séance de course à pied"):
@@ -455,11 +495,15 @@ class CourseModal(ui.Modal, title="🏃 Ta séance de course à pied"):
         placeholder="Ex: Footing 45min en EF, ou 10x400m récup 1'",
         min_length=3, max_length=1000)
 
+    def __init__(self, jour: date):
+        super().__init__()
+        self.jour = jour
+
     async def on_submit(self, interaction: discord.Interaction):
         # Préfixe imposé : le texte libre pourrait commencer par « repos » ou
         # contenir « muscu », ce qui fausserait est_repos() / seance_type().
         await programmer_seance_repos(
-            interaction, f"course à pied : {str(self.contenu).strip()}", "Footing", "🏃")
+            interaction, self.jour, f"course à pied : {str(self.contenu).strip()}", "Footing", "🏃")
 
 
 class ChoixSeanceView(ui.View):
@@ -470,16 +514,22 @@ class ChoixSeanceView(ui.View):
     @ui.button(label="💪 Muscu", style=discord.ButtonStyle.primary,
                custom_id="btn_choix_muscu")
     async def muscu(self, interaction: discord.Interaction, button: ui.Button):
-        await interaction.response.send_modal(MuscuModal())
+        if journee_close(interaction):
+            await fermer_journee(interaction); return
+        await interaction.response.send_modal(MuscuModal(aujourdhui()))
 
     @ui.button(label="🏃 Course à pied", style=discord.ButtonStyle.primary,
                custom_id="btn_choix_course")
     async def course(self, interaction: discord.Interaction, button: ui.Button):
-        await interaction.response.send_modal(CourseModal())
+        if journee_close(interaction):
+            await fermer_journee(interaction); return
+        await interaction.response.send_modal(CourseModal(aujourdhui()))
 
     @ui.button(label="↩️ Retour", style=discord.ButtonStyle.secondary,
                custom_id="btn_choix_retour")
     async def retour(self, interaction: discord.Interaction, button: ui.Button):
+        if journee_close(interaction):
+            await fermer_journee(interaction); return
         await interaction.response.edit_message(view=ReposView())
 
 
@@ -493,11 +543,15 @@ class ReposView(ui.View):
     @ui.button(label="🏋️ Je fais une séance", style=discord.ButtonStyle.primary,
                custom_id="btn_repos_muscu")
     async def seance(self, interaction: discord.Interaction, button: ui.Button):
+        if journee_close(interaction):
+            await fermer_journee(interaction); return
         await interaction.response.edit_message(view=ChoixSeanceView())
 
     @ui.button(label="🛋️ Vraie récup", style=discord.ButtonStyle.secondary,
                custom_id="btn_repos_off")
     async def recup(self, interaction: discord.Interaction, button: ui.Button):
+        if journee_close(interaction):
+            await fermer_journee(interaction); return
         await interaction.response.edit_message(
             content=(f"🛋️ <@{DISCORD_USER_ID}> Repos complet aujourd'hui, "
                      f"la récup fait partie du plan. À demain !"),
@@ -510,13 +564,15 @@ class SeanceView(ui.View):
         super().__init__(timeout=None)
 
     async def _today_row(self):
-        today_str = date.today().isoformat()
+        today_str = aujourdhui().isoformat()
         rows = await asyncio.to_thread(get_rows)
         row_idx = find_row(rows, today_str)
         return rows, row_idx
 
     @ui.button(label="✅ Séance faite", style=discord.ButtonStyle.success, custom_id="btn_valider")
     async def valider(self, interaction: discord.Interaction, button: ui.Button):
+        if journee_close(interaction):
+            await fermer_journee(interaction); return
         rows, row_idx = await self._today_row()
         if row_idx is None:
             await interaction.response.send_message("❌ Aucune séance trouvée pour aujourd'hui.", ephemeral=True)
@@ -525,6 +581,8 @@ class SeanceView(ui.View):
 
     @ui.button(label="❌ Non réalisée", style=discord.ButtonStyle.danger, custom_id="btn_non_realise")
     async def non_realise(self, interaction: discord.Interaction, button: ui.Button):
+        if journee_close(interaction):
+            await fermer_journee(interaction); return
         rows, row_idx = await self._today_row()
         if row_idx is None:
             await interaction.response.send_message("❌ Aucune séance trouvée pour aujourd'hui.", ephemeral=True)
@@ -557,7 +615,7 @@ def invalidate_seance_cache():
 
 async def get_today_seance() -> dict:
     """Renvoie {"date", "row_idx", "seance", "jour"} pour aujourd'hui (avec cache)."""
-    today_str = date.today().isoformat()
+    today_str = aujourdhui().isoformat()
     if _seance_cache.get("date") == today_str:
         return _seance_cache
     rows    = await asyncio.to_thread(get_rows)
@@ -569,7 +627,7 @@ async def get_today_seance() -> dict:
         row = rows[row_idx]
         info["seance"] = row[COL_SEANCE].strip() if len(row) > COL_SEANCE else ""
         info["jour"]   = (row[COL_JOUR].strip() if len(row) > COL_JOUR else ""
-                          ) or JOURS_FR[date.today().strftime("%A")]
+                          ) or JOURS_FR[aujourdhui().strftime("%A")]
     _seance_cache.clear()
     _seance_cache.update(info)
     return _seance_cache
@@ -578,7 +636,7 @@ async def get_today_seance() -> dict:
 async def build_seance_response():
     """Construit (content, view) du message de séance du jour. view=None si pas de boutons."""
     info    = await get_today_seance()
-    date_fr = date.today().strftime("%d/%m/%Y")
+    date_fr = aujourdhui().strftime("%d/%m/%Y")
     if info["row_idx"] is None:
         return (f"<@{DISCORD_USER_ID}> Aucune séance trouvée pour aujourd'hui ({info['date']}) 🤔", None)
     # Note du coach relue à chaque appel, JAMAIS mise en cache : le cache de séance
@@ -611,7 +669,7 @@ async def build_semaine_response() -> str:
     """Récap texte de toutes les séances de la semaine en cours (lundi → dimanche)."""
     rows  = await asyncio.to_thread(get_rows)
     kmc   = km_jour_col(rows)
-    today = date.today()
+    today = aujourdhui()
     week_start = today - datetime.timedelta(days=today.weekday())   # lundi
     week_end   = week_start + datetime.timedelta(days=6)
     nc    = notes_nico_col(rows)
@@ -736,7 +794,7 @@ async def apply_programme(date_raw: str, seance: str) -> str:
     if row_idx is None:
         return f"Aucune ligne trouvée pour **{date_raw}** ({date_iso}) dans le planning."
     await asyncio.to_thread(write_cell, row_idx, COL_SEANCE, seance)
-    if date_iso == date.today().isoformat():
+    if date_iso == aujourdhui().isoformat():
         invalidate_seance_cache()
         set_annonce(seance, _annonce.get("note", ""))
     try:
@@ -833,9 +891,9 @@ async def evening_check_task():
     channel = bot.get_channel(DISCORD_CHANNEL_ID)
     if not channel: return
 
-    today_str = date.today().isoformat()
-    date_fr   = date.today().strftime("%d/%m/%Y")
-    today_day = JOURS_FR[date.today().strftime("%A")]
+    today_str = aujourdhui().isoformat()
+    date_fr   = aujourdhui().strftime("%d/%m/%Y")
+    today_day = JOURS_FR[aujourdhui().strftime("%A")]
 
     rows    = await asyncio.to_thread(get_rows)
     await asyncio.to_thread(backfill_dates, rows)   # complète les dates col A manquantes
@@ -850,9 +908,14 @@ async def evening_check_task():
     row        = rows[row_idx]
     seance_txt = row[COL_SEANCE].strip() if len(row) > COL_SEANCE else ""
 
-    # Case vide ou repos → message neutre, pas de tag
+    # Case vide ou repos → dernier rappel neutre, pas de tag. La journée reste
+    # ouverte jusqu'à minuit : on laisse les boutons pour ajouter une séance.
     if est_repos(seance_txt):
-        await channel.send(f"😴 Pas de séance programmée aujourd'hui, bonne récupération ! 🛋️")
+        await channel.send(
+            content=(f"😴 Dernier rappel : pas de séance programmée aujourd'hui, "
+                     f"bonne récupération ! 🛋️\n"
+                     f"Si tu t'y mets quand même, tu as jusqu'à minuit pour l'ajouter 👇"),
+            view=ReposView())
         return
 
     # Déjà répondu → rien faire
@@ -865,10 +928,10 @@ async def evening_check_task():
     # Séance prévue mais pas encore renseignée → retag avec boutons
     view = SeanceView()
     await channel.send(
-        content=(f"⏰ <@{DISCORD_USER_ID}> Tu n'as pas encore renseigné ta séance ! 👀\n\n"
+        content=(f"⏰ <@{DISCORD_USER_ID}> Dernier rappel : tu n'as pas encore renseigné ta séance ! 👀\n\n"
                  f"**📅 Rappel : {today_day} {date_fr}**\n> **{seance_txt}**"
                  f"{bloc_note(note_coach(rows, row_idx))}\n\n"
-                 f"Valide ta séance avant de dormir 👇"),
+                 f"Tu as jusqu'à minuit pour la valider 👇"),
         view=view)
 
 
@@ -881,7 +944,7 @@ async def before_evening():
 @tasks.loop(time=datetime.time(hour=21, minute=0, tzinfo=PARIS))
 async def weekly_summary_task():
     """Dimanche à 21h → résumé semaine + graphique progression."""
-    if date.today().weekday() != 6: return
+    if aujourdhui().weekday() != 6: return
     channel = bot.get_channel(DISCORD_CHANNEL_ID)
     if not channel: return
 
@@ -928,15 +991,15 @@ async def morning_reminder_task():
     except Exception as e:
         print(f"⚠️ Rappel matin (lecture sheet) : {e}"); return
 
-    today_str = date.today().isoformat()
+    today_str = aujourdhui().isoformat()
     row_idx   = find_row(rows, today_str)
     if row_idx is None:
         print(f"⚠️ Rappel matin : aucune ligne pour {today_str}"); return
 
     row     = rows[row_idx]
     seance  = row[COL_SEANCE].strip() if len(row) > COL_SEANCE else "Repos"
-    jour    = row[COL_JOUR].strip()   if len(row) > COL_JOUR   else JOURS_FR[date.today().strftime("%A")]
-    date_fr = date.today().strftime("%d/%m/%Y")
+    jour    = row[COL_JOUR].strip()   if len(row) > COL_JOUR   else JOURS_FR[aujourdhui().strftime("%A")]
+    date_fr = aujourdhui().strftime("%d/%m/%Y")
 
     note = note_coach(rows, row_idx)   # consigne du coach livrée AVEC la séance
     if est_repos(seance):
@@ -966,7 +1029,7 @@ async def before_morning_reminder():
 
 
 # ── TÂCHE 4 : LE COACH A-T-IL MODIFIÉ LA JOURNÉE ? (toutes les 30 min) ───────
-WATCH_DEBUT, WATCH_FIN = 9, 21        # fenêtre de surveillance, heures de Paris
+WATCH_DEBUT, WATCH_FIN = 9, 24        # fenêtre de surveillance, heures de Paris (jusqu'à minuit)
 
 @tasks.loop(minutes=30)
 async def seance_watch_task():
@@ -979,7 +1042,7 @@ async def seance_watch_task():
     channel = bot.get_channel(DISCORD_CHANNEL_ID)
     if not channel: return
 
-    today_str = date.today().isoformat()
+    today_str = aujourdhui().isoformat()
     try:
         rows = await asyncio.to_thread(get_rows)
     except Exception as e:
