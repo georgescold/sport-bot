@@ -12,8 +12,9 @@ bot.py - Bot Discord "Road to sub 38"
   toutes les 30 min        → prévient si le coach modifie la journée après 8h00 (jusqu'à minuit)
   21h05 quotidien          → dernier rappel si séance non renseignée (ou msg neutre
                              avec boutons si repos) ; la journée reste ouverte
-  minuit (Paris)           → la journée ferme : les boutons de ses messages ne
-                             répondent plus, cf. journee_close()
+  après minuit             → les boutons d'un message écrivent toujours dans SA
+                             journée : un oubli de la veille se rattrape depuis
+                             son message, cf. jour_du_message()
   21h00 dimanche           → résumé hebdomadaire + graphique Strava-like
 
 Le suivi du second athlète (Enzo, musculation) vit dans enzo.py : autre classeur,
@@ -55,8 +56,7 @@ PARIS = ZoneInfo("Europe/Paris")
 
 def aujourdhui() -> date:
     """Le jour vécu à Paris, pas celui du serveur. Railway tourne en UTC : entre
-    minuit et 2h du matin, date.today() renverrait encore la veille, et la journée
-    ne fermerait pas à minuit."""
+    minuit et 2h du matin, date.today() renverrait encore la veille."""
     return datetime.datetime.now(PARIS).date()
 
 # Disposition « Données Loys » : A=date B=jour C=séance … F=ressentis
@@ -381,17 +381,21 @@ class RessentisModal(ui.Modal, title="🏃 Ta séance du jour"):
     km = ui.TextInput(label="Kilomètres réalisés",
         placeholder="Ex: 5.2", min_length=1, max_length=10)
 
-    def __init__(self, row_index, km_col=COL_KM_JOUR):
+    def __init__(self, row_index, km_col=COL_KM_JOUR, jour: date = None):
         super().__init__()
         self.row_index = row_index
         self.km_col    = km_col   # colonne km_journee résolue par en-tête
+        self.jour      = jour
 
     async def on_submit(self, interaction: discord.Interaction):
         r = str(self.ressentis); k = str(self.km).replace(",", ".")
         await asyncio.to_thread(write_cell, self.row_index, COL_RESSENTIS, r)
         await asyncio.to_thread(write_cell, self.row_index, self.km_col, k, True)
+        quand = ""
+        if self.jour and self.jour != aujourdhui():     # rattrapage d'un oubli
+            quand = f" pour ta séance de {JOURS_FR[self.jour.strftime('%A')].lower()} {self.jour.strftime('%d/%m')}"
         await interaction.response.edit_message(
-            content=(f"<@{DISCORD_USER_ID}> Super, c'est noté ! 🎉\n"
+            content=(f"<@{DISCORD_USER_ID}> Super, c'est noté{quand} ! 🎉\n"
                      f"**Ressentis :** {r}\n**Km :** {k} km\nBravo pour la séance ! 🏃‍♂️🔥"),
             view=None)
 
@@ -417,43 +421,27 @@ def est_repos(seance: str) -> bool:
     return (not (seance or "").strip()) or seance_type(seance) == "Repos"
 
 
-# ── LA JOURNÉE FERME À MINUIT ────────────────────────────────────────────────
-# Les boutons sont persistants et cherchent « la ligne du jour » au moment du
-# clic : sans garde, un bouton de la veille cliqué après minuit écrirait dans la
-# journée suivante. Un message appartient au jour (Paris) où il a été posté ;
-# passé minuit, ses boutons ferment la journée au lieu d'écrire. Le rappel de
-# 21h05 n'est qu'un dernier rappel : jusqu'à minuit, tout reste cliquable.
+# ── CHAQUE MESSAGE APPARTIENT À SA JOURNÉE ───────────────────────────────────
+# Les boutons sont persistants : un message reste cliquable après minuit. Ils
+# écrivent dans la journée (Paris) où le message a été posté, pas dans celle du
+# clic. Une séance oubliée la veille se rattrape donc depuis son propre message,
+# et un clic tardif ne peut jamais écrire dans la journée suivante, qui a son
+# propre message à 8h00.
 def jour_du_message(interaction: discord.Interaction) -> date:
     msg = interaction.message
     return msg.created_at.astimezone(PARIS).date() if msg else aujourdhui()
 
 
-def journee_close(interaction: discord.Interaction) -> bool:
-    return jour_du_message(interaction) != aujourdhui()
-
-
-async def fermer_journee(interaction: discord.Interaction):
-    """Retire les boutons d'un message d'une journée terminée et explique quoi faire."""
-    jour = jour_du_message(interaction)
-    fin  = (f"\n\n🔒 Journée du {jour.strftime('%d/%m')} close à minuit. "
-            f"Pour la compléter quand même : `!claude` + ce que tu as fait.")
-    contenu = interaction.message.content or ""
-    await interaction.response.edit_message(
-        content=contenu[:2000 - len(fin)] + fin, view=None)
-
-
 async def programmer_seance_repos(interaction: discord.Interaction, jour: date,
                                   texte: str, typ: str, emoji: str):
-    """Jour de repos : écrit dans la ligne du jour la séance que Loys s'est
-    programmée (col C + type en col E), puis affiche les boutons de validation.
-    `jour` est figé à l'ouverture de la modale : validée à 00h01, elle écrit
-    quand même dans la bonne journée."""
-    today_str = jour.isoformat()
-    rows      = await asyncio.to_thread(get_rows)
-    row_idx   = find_row(rows, today_str)
+    """Jour de repos : écrit dans la ligne de `jour` (le jour du message) la
+    séance que Loys s'est programmée (col C + type en col E), puis affiche les
+    boutons de validation."""
+    rows    = await asyncio.to_thread(get_rows)
+    row_idx = find_row(rows, jour.isoformat())
     if row_idx is None:
         await interaction.response.send_message(
-            "❌ Aucune ligne pour aujourd'hui dans le planning, impossible d'écrire.",
+            f"❌ Aucune ligne pour le {jour.strftime('%d/%m')} dans le planning, impossible d'écrire.",
             ephemeral=True)
         return
     # Le mot « repos » est volontairement remplacé : la journée devient une
@@ -514,22 +502,16 @@ class ChoixSeanceView(ui.View):
     @ui.button(label="💪 Muscu", style=discord.ButtonStyle.primary,
                custom_id="btn_choix_muscu")
     async def muscu(self, interaction: discord.Interaction, button: ui.Button):
-        if journee_close(interaction):
-            await fermer_journee(interaction); return
-        await interaction.response.send_modal(MuscuModal(aujourdhui()))
+        await interaction.response.send_modal(MuscuModal(jour_du_message(interaction)))
 
     @ui.button(label="🏃 Course à pied", style=discord.ButtonStyle.primary,
                custom_id="btn_choix_course")
     async def course(self, interaction: discord.Interaction, button: ui.Button):
-        if journee_close(interaction):
-            await fermer_journee(interaction); return
-        await interaction.response.send_modal(CourseModal(aujourdhui()))
+        await interaction.response.send_modal(CourseModal(jour_du_message(interaction)))
 
     @ui.button(label="↩️ Retour", style=discord.ButtonStyle.secondary,
                custom_id="btn_choix_retour")
     async def retour(self, interaction: discord.Interaction, button: ui.Button):
-        if journee_close(interaction):
-            await fermer_journee(interaction); return
         await interaction.response.edit_message(view=ReposView())
 
 
@@ -543,15 +525,11 @@ class ReposView(ui.View):
     @ui.button(label="🏋️ Je fais une séance", style=discord.ButtonStyle.primary,
                custom_id="btn_repos_muscu")
     async def seance(self, interaction: discord.Interaction, button: ui.Button):
-        if journee_close(interaction):
-            await fermer_journee(interaction); return
         await interaction.response.edit_message(view=ChoixSeanceView())
 
     @ui.button(label="🛋️ Vraie récup", style=discord.ButtonStyle.secondary,
                custom_id="btn_repos_off")
     async def recup(self, interaction: discord.Interaction, button: ui.Button):
-        if journee_close(interaction):
-            await fermer_journee(interaction); return
         await interaction.response.edit_message(
             content=(f"🛋️ <@{DISCORD_USER_ID}> Repos complet aujourd'hui, "
                      f"la récup fait partie du plan. À demain !"),
@@ -559,39 +537,37 @@ class ReposView(ui.View):
 
 
 class SeanceView(ui.View):
-    """Vue persistante : trouve la ligne du jour dynamiquement."""
+    """Vue persistante : trouve la ligne du jour du message dynamiquement."""
     def __init__(self):
         super().__init__(timeout=None)
 
-    async def _today_row(self):
-        today_str = aujourdhui().isoformat()
+    async def _ligne_du_message(self, interaction: discord.Interaction):
+        jour = jour_du_message(interaction)
         rows = await asyncio.to_thread(get_rows)
-        row_idx = find_row(rows, today_str)
-        return rows, row_idx
+        return rows, find_row(rows, jour.isoformat()), jour
 
     @ui.button(label="✅ Séance faite", style=discord.ButtonStyle.success, custom_id="btn_valider")
     async def valider(self, interaction: discord.Interaction, button: ui.Button):
-        if journee_close(interaction):
-            await fermer_journee(interaction); return
-        rows, row_idx = await self._today_row()
+        rows, row_idx, jour = await self._ligne_du_message(interaction)
         if row_idx is None:
-            await interaction.response.send_message("❌ Aucune séance trouvée pour aujourd'hui.", ephemeral=True)
+            await interaction.response.send_message(
+                f"❌ Aucune séance trouvée pour le {jour.strftime('%d/%m')}.", ephemeral=True)
             return
-        await interaction.response.send_modal(RessentisModal(row_idx, km_jour_col(rows)))
+        await interaction.response.send_modal(RessentisModal(row_idx, km_jour_col(rows), jour))
 
     @ui.button(label="❌ Non réalisée", style=discord.ButtonStyle.danger, custom_id="btn_non_realise")
     async def non_realise(self, interaction: discord.Interaction, button: ui.Button):
-        if journee_close(interaction):
-            await fermer_journee(interaction); return
-        rows, row_idx = await self._today_row()
+        rows, row_idx, jour = await self._ligne_du_message(interaction)
         if row_idx is None:
-            await interaction.response.send_message("❌ Aucune séance trouvée pour aujourd'hui.", ephemeral=True)
+            await interaction.response.send_message(
+                f"❌ Aucune séance trouvée pour le {jour.strftime('%d/%m')}.", ephemeral=True)
             return
         seance_txt = rows[row_idx][COL_SEANCE].strip() if len(rows[row_idx]) > COL_SEANCE else ""
         await asyncio.to_thread(write_cell, row_idx, COL_SEANCE,
                                 f"{seance_txt} - ❌ Non réalisée")
         invalidate_seance_cache()
-        set_annonce(f"{seance_txt} - ❌ Non réalisée", _annonce.get("note", ""))
+        if jour == aujourdhui():   # une veille modifiée ne doit pas fausser la surveillance du jour
+            set_annonce(f"{seance_txt} - ❌ Non réalisée", _annonce.get("note", ""))
         await interaction.response.edit_message(
             content=(f"<@{DISCORD_USER_ID}> Pas de souci, c'est noté ! 💪\n"
                      f"Séance marquée comme non réalisée. À demain !"),
@@ -909,12 +885,12 @@ async def evening_check_task():
     seance_txt = row[COL_SEANCE].strip() if len(row) > COL_SEANCE else ""
 
     # Case vide ou repos → dernier rappel neutre, pas de tag. La journée reste
-    # ouverte jusqu'à minuit : on laisse les boutons pour ajouter une séance.
+    # ouverte : on laisse les boutons pour ajouter une séance.
     if est_repos(seance_txt):
         await channel.send(
             content=(f"😴 Dernier rappel : pas de séance programmée aujourd'hui, "
                      f"bonne récupération ! 🛋️\n"
-                     f"Si tu t'y mets quand même, tu as jusqu'à minuit pour l'ajouter 👇"),
+                     f"Si tu t'y mets quand même, tu peux encore l'ajouter 👇"),
             view=ReposView())
         return
 
@@ -931,7 +907,7 @@ async def evening_check_task():
         content=(f"⏰ <@{DISCORD_USER_ID}> Dernier rappel : tu n'as pas encore renseigné ta séance ! 👀\n\n"
                  f"**📅 Rappel : {today_day} {date_fr}**\n> **{seance_txt}**"
                  f"{bloc_note(note_coach(rows, row_idx))}\n\n"
-                 f"Tu as jusqu'à minuit pour la valider 👇"),
+                 f"Valide ta séance avant de dormir 👇"),
         view=view)
 
 
