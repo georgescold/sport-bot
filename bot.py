@@ -7,7 +7,8 @@ bot.py - Bot Discord "Road to sub 38"
   Bouton ✅                → modale ressentis + km
   Bouton ❌                → séance non réalisée
   8h00 quotidien           → séance du jour + note du coach + boutons de validation
-                             (jour de repos → propose une séance de muscu à saisir)
+                             (jour de repos → propose une séance à saisir :
+                              muscu ou course à pied)
   toutes les 30 min        → prévient si le coach modifie la journée après 8h00
   21h05 quotidien          → rappel si séance non renseignée (ou msg neutre si vide)
   21h00 dimanche           → résumé hebdomadaire + graphique Strava-like
@@ -407,48 +408,92 @@ def est_repos(seance: str) -> bool:
     return (not (seance or "").strip()) or seance_type(seance) == "Repos"
 
 
+async def programmer_seance_repos(interaction: discord.Interaction,
+                                  texte: str, typ: str, emoji: str):
+    """Jour de repos : écrit dans la ligne du jour la séance que Loys s'est
+    programmée (col C + type en col E), puis affiche les boutons de validation."""
+    today_str = date.today().isoformat()
+    rows      = await asyncio.to_thread(get_rows)
+    row_idx   = find_row(rows, today_str)
+    if row_idx is None:
+        await interaction.response.send_message(
+            "❌ Aucune ligne pour aujourd'hui dans le planning, impossible d'écrire.",
+            ephemeral=True)
+        return
+    # Le mot « repos » est volontairement remplacé : la journée devient une
+    # vraie séance pour tout le reste du bot (relance 21h05, récap hebdo,
+    # graphe) qui teste la présence de « repos » dans la col C.
+    await asyncio.to_thread(write_cell, row_idx, COL_SEANCE, texte)
+    await asyncio.to_thread(write_cell, row_idx, COL_TYPE, typ)
+    invalidate_seance_cache()
+    set_annonce(texte, _annonce.get("note", ""))
+    jour = JOURS_FR[date.today().strftime("%A")]
+    await interaction.response.edit_message(
+        content=(f"{emoji} <@{DISCORD_USER_ID}> C'est noté dans le planning !\n\n"
+                 f"**📅 Séance : {jour} {date.today().strftime('%d/%m/%Y')}**\n"
+                 f"> **{texte}**\n\n"
+                 f"Clique sur un bouton une fois la séance terminée 👇"),
+        view=SeanceView())
+
+
 class MuscuModal(ui.Modal, title="💪 Ta séance de muscu"):
-    """Jour de repos : Loys saisit lui-même la séance qu'il veut faire."""
+    """Jour de repos : Loys saisit lui-même la muscu qu'il veut faire."""
     contenu = ui.TextInput(label="Ton programme",
         style=discord.TextStyle.paragraph,
         placeholder="Ex: Pompes 3x15, DC barre 4x10 (récup 3'), tractions 4x8, gainage 3x1'",
         min_length=3, max_length=1000)
 
     async def on_submit(self, interaction: discord.Interaction):
-        today_str = date.today().isoformat()
-        rows      = await asyncio.to_thread(get_rows)
-        row_idx   = find_row(rows, today_str)
-        if row_idx is None:
-            await interaction.response.send_message(
-                "❌ Aucune ligne pour aujourd'hui dans le planning, impossible d'écrire.",
-                ephemeral=True)
-            return
-        # Le mot « repos » est volontairement remplacé : la journée devient une
-        # vraie séance pour tout le reste du bot (relance 21h05, récap hebdo,
-        # graphe) qui teste la présence de « repos » dans la col C.
-        texte = f"renfo muscu : {str(self.contenu).strip()}"
-        await asyncio.to_thread(write_cell, row_idx, COL_SEANCE, texte)
-        await asyncio.to_thread(write_cell, row_idx, COL_TYPE, "Renfo")
-        invalidate_seance_cache()
-        set_annonce(texte, _annonce.get("note", ""))
-        jour = JOURS_FR[date.today().strftime("%A")]
-        await interaction.response.edit_message(
-            content=(f"💪 <@{DISCORD_USER_ID}> C'est noté dans le planning !\n\n"
-                     f"**📅 Séance : {jour} {date.today().strftime('%d/%m/%Y')}**\n"
-                     f"> **{texte}**\n\n"
-                     f"Clique sur un bouton une fois la séance terminée 👇"),
-            view=SeanceView())
+        await programmer_seance_repos(
+            interaction, f"renfo muscu : {str(self.contenu).strip()}", "Renfo", "💪")
 
 
-class ReposView(ui.View):
-    """Vue persistante des jours de repos : propose d'ajouter une muscu."""
+class CourseModal(ui.Modal, title="🏃 Ta séance de course à pied"):
+    """Jour de repos : Loys saisit lui-même la sortie qu'il veut faire."""
+    contenu = ui.TextInput(label="Ta séance",
+        style=discord.TextStyle.paragraph,
+        placeholder="Ex: Footing 45min en EF, ou 10x400m récup 1'",
+        min_length=3, max_length=1000)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        # Préfixe imposé : le texte libre pourrait commencer par « repos » ou
+        # contenir « muscu », ce qui fausserait est_repos() / seance_type().
+        await programmer_seance_repos(
+            interaction, f"course à pied : {str(self.contenu).strip()}", "Footing", "🏃")
+
+
+class ChoixSeanceView(ui.View):
+    """Vue persistante, 2e étape du jour de repos : quel type de séance ?"""
     def __init__(self):
         super().__init__(timeout=None)
 
-    @ui.button(label="💪 Je fais une muscu", style=discord.ButtonStyle.primary,
-               custom_id="btn_repos_muscu")
+    @ui.button(label="💪 Muscu", style=discord.ButtonStyle.primary,
+               custom_id="btn_choix_muscu")
     async def muscu(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.send_modal(MuscuModal())
+
+    @ui.button(label="🏃 Course à pied", style=discord.ButtonStyle.primary,
+               custom_id="btn_choix_course")
+    async def course(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.send_modal(CourseModal())
+
+    @ui.button(label="↩️ Retour", style=discord.ButtonStyle.secondary,
+               custom_id="btn_choix_retour")
+    async def retour(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.edit_message(view=ReposView())
+
+
+class ReposView(ui.View):
+    """Vue persistante des jours de repos : propose de programmer une séance."""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    # custom_id historique conservé : les messages de repos déjà postés avec
+    # l'ancien bouton « Je fais une muscu » restent cliquables.
+    @ui.button(label="🏋️ Je fais une séance", style=discord.ButtonStyle.primary,
+               custom_id="btn_repos_muscu")
+    async def seance(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.edit_message(view=ChoixSeanceView())
 
     @ui.button(label="🛋️ Vraie récup", style=discord.ButtonStyle.secondary,
                custom_id="btn_repos_off")
@@ -545,7 +590,7 @@ async def build_seance_response():
         return ((f"😴 <@{DISCORD_USER_ID}> Aujourd'hui c'est repos !\n\n"
                  f"**📅 Repos : {info['jour']} {date_fr}**"
                  f"{bloc_note(note)}\n\n"
-                 f"Tu veux quand même faire une séance de muscu ? 👇"), ReposView())
+                 f"Tu veux quand même faire une séance ? 👇"), ReposView())
     content = (f"🏃 Hey <@{DISCORD_USER_ID}> ! N'oublie pas de t'entraîner ! 💪\n\n"
                f"**📅 Séance : {info['jour']} {date_fr}**\n> **{info['seance']}**"
                f"{bloc_note(note)}\n\n"
@@ -615,6 +660,7 @@ async def on_ready():
     if not seance_watch_task.is_running(): seance_watch_task.start()
     bot.add_view(SeanceView())
     bot.add_view(ReposView())
+    bot.add_view(ChoixSeanceView())
     if enzo:
         try:
             enzo.init(bot, prochain_run=next_routine_run)
@@ -894,11 +940,11 @@ async def morning_reminder_task():
 
     note = note_coach(rows, row_idx)   # consigne du coach livrée AVEC la séance
     if est_repos(seance):
-        # Jour de repos : on propose une muscu plutôt que d'envoyer un rappel vide.
+        # Jour de repos : on propose une séance plutôt que d'envoyer un rappel vide.
         content = (f"😴 <@{DISCORD_USER_ID}> Aujourd'hui c'est repos !\n\n"
                    f"**📅 Repos : {jour} {date_fr}**"
                    f"{bloc_note(note)}\n\n"
-                   f"Tu veux quand même faire une séance de muscu ? 👇")
+                   f"Tu veux quand même faire une séance ? 👇")
         view = ReposView()
     else:
         content = (f"🏃 Hey <@{DISCORD_USER_ID}> ! N'oublie pas de t'entraîner ! 💪\n\n"
